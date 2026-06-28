@@ -1,0 +1,55 @@
+# BOSS 直聘搜索与评分配置
+# 按岗位需求自定义关键词、筛选条件、评分权重
+
+job:
+  title: "电商品牌项目经理"
+  salary: "20-30K"
+  city: "广州"
+  experience: "3-5年"
+
+company:
+  name: "某电商品牌公司"
+  description: "服饰品牌电商运营"
+
+requirements:
+  must_have:
+    - "3年以上电商运营经验"
+    - "有品牌项目管理经验"
+    - "熟悉主流电商平台规则"
+  nice_to_have:
+    - "有服饰/配饰行业经验"
+    - "PMP认证"
+    - "有团队管理经验"
+
+filter:
+  max_age: 35
+  max_salary_k: 40
+  exclude_status:
+    - "暂不考虑"
+
+keywords:
+  - "天猫运营"
+  - "淘宝运营"
+  - "电商运营"
+  - "拼多多运营"
+  - "抖音运营"
+  - "品牌运营"
+  - "电商项目经理"
+  - "网络推广"
+
+scoring:
+  domain_keywords:
+    - "电商"
+    - "品牌"
+    - "电商运营"
+    - "服饰"
+  tech_keywords:
+    - "项目管理"
+    - "天猫"
+    - "拼多多"
+    - "直通车"
+  bonus_keywords:
+    - "0-1"
+    - "从0到1"
+    - "搭建"
+    - "团队管理"
