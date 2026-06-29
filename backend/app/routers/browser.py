@@ -25,8 +25,11 @@ async def start(req: BrowserStartRequest):
     user_data_dir = req.user_data_dir or os.path.join(
         os.path.dirname(__file__), "..", "..", "data", "browser_profile"
     )
-    ok, msg = await start_browser(user_data_dir=user_data_dir, headless=req.headless)
-    return {"success": ok, "message": msg}
+    ok, msg, warning = await start_browser(user_data_dir=user_data_dir, headless=req.headless)
+    resp = {"success": ok, "message": msg}
+    if warning:
+        resp["warning"] = warning
+    return resp
 
 
 @router.get("/browser/status", response_model=BrowserStatus)

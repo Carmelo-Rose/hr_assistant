@@ -69,6 +69,7 @@ export default function Dashboard() {
   const [jobFilter, setJobFilter] = useState('');
   const [actionLoading, setActionLoading] = useState<string | null>(null);
   const [captureResult, setCaptureResult] = useState<string | null>(null);
+  const [browserWarning, setBrowserWarning] = useState<string | null>(null);
 
   // Queries
   const { data: jobs } = useQuery({ queryKey: ['jobs'], queryFn: listJobs });
@@ -134,7 +135,17 @@ export default function Dashboard() {
         </div>
         <div className="flex items-center gap-2 flex-wrap">
           <button
-            onClick={() => handleAction('startBrowser', () => startBrowser(false))}
+            onClick={async () => {
+              setActionLoading('startBrowser');
+              setBrowserWarning(null);
+              try {
+                const res = await startBrowser(false);
+                if (res.warning) setBrowserWarning(res.warning);
+              } finally {
+                setActionLoading(null);
+                queryClient.invalidateQueries({ queryKey: ['browserStatus'] });
+              }
+            }}
             disabled={actionLoading !== null}
             className={`px-3 py-1.5 text-sm rounded-lg disabled:opacity-50 disabled:cursor-not-allowed ${
               browserStatus?.running
@@ -142,7 +153,7 @@ export default function Dashboard() {
                 : 'bg-blue-600 text-white hover:bg-blue-700'
             }`}
           >
-            {browserStatus?.running ? '重启浏览器' : '启动浏览器'}
+            {actionLoading === 'startBrowser' ? '连接中…' : browserStatus?.running ? '重启浏览器' : '启动浏览器'}
           </button>
           <button
             onClick={() => handleAction('capture', () => captureMutation.mutateAsync())}
@@ -157,6 +168,12 @@ export default function Dashboard() {
             </span>
           )}
         </div>
+        {browserWarning && (
+          <div className="mt-3 flex items-start gap-2 rounded-lg bg-amber-50 border border-amber-200 px-3 py-2.5 text-sm text-amber-800">
+            <span className="mt-0.5 shrink-0">⚠️</span>
+            <span className="whitespace-pre-wrap">{browserWarning}</span>
+          </div>
+        )}
       </div>
 
       {/* Queue */}

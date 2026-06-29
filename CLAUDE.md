@@ -48,8 +48,16 @@ cd frontend && npm run lint
 ### Before running: connect Chrome
 
 ```bash
-# Chrome must expose CDP on port 9222:
-# Open Chrome with: --remote-debugging-port=9222
+# Chrome v120+ requires --user-data-dir when enabling remote debugging.
+# Using the backend's profile dir so BOSS login cookies persist across restarts.
+/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome \
+  --remote-debugging-port=9222 \
+  --user-data-dir="$(pwd)/backend/data/browser_profile" \
+  --no-first-run
+
+# Verify the port is open:
+curl http://127.0.0.1:9222/json/version
+
 # Then connect backend to it:
 curl -X POST http://localhost:8000/api/browser/start
 ```
