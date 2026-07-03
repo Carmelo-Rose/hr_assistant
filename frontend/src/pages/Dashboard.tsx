@@ -6,7 +6,9 @@ import {
   listJobs,
   createDraft,
   updateStatus,
+  bulkUpdateStatus,
   llmRerank,
+  resetDb,
   type QueueItem,
   type Job,
 } from '../api';
@@ -62,6 +64,24 @@ function StatusBadge({ status }: { status: string }) {
   );
 }
 
+function ConfirmDialog({ message, onConfirm, onCancel }: { message: string; onConfirm: () => void; onCancel: () => void }) {
+  return (
+    <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/30" onClick={onCancel}>
+      <div className="bg-white rounded-xl shadow-xl p-5 w-80" onClick={e => e.stopPropagation()}>
+        <p className="text-sm text-gray-700">{message}</p>
+        <div className="flex justify-end gap-2 mt-4">
+          <button onClick={onCancel} className="px-3 py-1.5 text-xs font-medium text-gray-600 rounded-lg hover:bg-gray-100">
+            取消
+          </button>
+          <button onClick={onConfirm} className="px-3 py-1.5 text-xs font-medium bg-blue-600 text-white rounded-lg hover:bg-blue-700">
+            确认
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function MissingWarning({ info }: { info: string }) {
   if (!info) return null;
   return (
@@ -80,6 +100,8 @@ export default function Dashboard() {
   const [jobFilter, setJobFilter] = useState('');
   const [view, setView] = useState<'active' | 'skipped'>('active');
   const [actionLoading, setActionLoading] = useState<string | null>(null);
+  const [drafts, setDrafts] = useState<Record<number, string>>({});
+  const [copiedId, setCopiedId] = useState<number | null>(null);
 
   // Queries
   const { data: jobs } = useQuery({ queryKey: ['jobs'], queryFn: listJobs });
@@ -92,12 +114,42 @@ export default function Dashboard() {
   // Mutations
   const draftMutation = useMutation({
     mutationFn: createDraft,
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['queue'] }),
+    onSuccess: (data, matchId) => {
+      setDrafts(prev => ({ ...prev, [matchId]: data.draft_text }));
+      queryClient.invalidateQueries({ queryKey: ['queue'] });
+    },
   });
+
+  const copyDraft = async (matchId: number, text: string) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopiedId(matchId);
+      setTimeout(() => setCopiedId(id => (id === matchId ? null : id)), 1500);
+    } catch { /* clipboard permission denied, ignore */ }
+  };
 
   const statusMutation = useMutation({
     mutationFn: ({ matchId, status }: { matchId: number; status: string }) => updateStatus(matchId, status),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['queue'] }),
+  });
+
+  const bulkMutation = useMutation({
+    mutationFn: ({ matchIds, status }: { matchIds: number[]; status: string }) => bulkUpdateStatus(matchIds, status),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['queue'] }),
+  });
+
+  const [pendingBulk, setPendingBulk] = useState<{ status: string; matchIds: number[]; message: string } | null>(null);
+
+  const [resetMsg, setResetMsg] = useState<string | null>(null);
+  const [resetStep, setResetStep] = useState<0 | 1 | 2>(0); // 0=未开始 1=第一次确认 2=第二次确认
+  const resetMutation = useMutation({
+    mutationFn: resetDb,
+    onSuccess: (res) => {
+      const total = Object.values(res.deleted).reduce((a, b) => a + b, 0);
+      setResetMsg(`数据库已清空，共删除 ${total} 条记录`);
+      queryClient.invalidateQueries({ queryKey: ['queue'] });
+    },
+    onError: (e: any) => setResetMsg('清理失败：' + (e?.message || '请求出错')),
   });
 
   const [rerankMsg, setRerankMsg] = useState<string | null>(null);
@@ -154,21 +206,63 @@ export default function Dashboard() {
             </div>
           </div>
           <div className="flex items-center gap-3">
-            {view === 'active' && (
+            {view === 'active' ? (
+              <>
+                <button
+                  onClick={() => { setRerankMsg(null); rerankMutation.mutate(); }}
+                  disabled={rerankMutation.isPending || !queue?.length}
+                  className="px-3 py-1.5 text-xs font-medium bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 disabled:opacity-40"
+                  title="用国产大模型对入围名单重新打分排序"
+                >
+                  {rerankMutation.isPending ? 'AI 精评中…' : 'AI 精评'}
+                </button>
+                <button
+                  onClick={() => {
+                    if (!queue?.length) return;
+                    setPendingBulk({
+                      status: 'skipped',
+                      matchIds: queue.map((i: QueueItem) => i.match_id),
+                      message: `确认跳过当前 ${queue.length} 位候选人？可在"已跳过"里一键恢复。`,
+                    });
+                  }}
+                  disabled={bulkMutation.isPending || !queue?.length}
+                  className="px-3 py-1.5 text-xs font-medium bg-gray-100 text-gray-600 rounded-lg hover:bg-gray-200 disabled:opacity-40"
+                >
+                  一键跳过
+                </button>
+              </>
+            ) : (
               <button
-                onClick={() => { setRerankMsg(null); rerankMutation.mutate(); }}
-                disabled={rerankMutation.isPending || !queue?.length}
-                className="px-3 py-1.5 text-xs font-medium bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 disabled:opacity-40"
-                title="用国产大模型对入围名单重新打分排序"
+                onClick={() => {
+                  if (!queue?.length) return;
+                  setPendingBulk({
+                    status: 'new',
+                    matchIds: queue.map((i: QueueItem) => i.match_id),
+                    message: `确认恢复当前 ${queue.length} 位候选人到队列？`,
+                  });
+                }}
+                disabled={bulkMutation.isPending || !queue?.length}
+                className="px-3 py-1.5 text-xs font-medium bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-40"
               >
-                {rerankMutation.isPending ? 'AI 精评中…' : 'AI 精评'}
+                一键恢复队列
               </button>
             )}
             <span className="text-sm text-gray-500">{queue?.length || 0} 人</span>
+            <button
+              onClick={() => { setResetMsg(null); setResetStep(1); }}
+              disabled={resetMutation.isPending}
+              className="px-3 py-1.5 text-xs font-medium bg-red-50 text-red-600 rounded-lg hover:bg-red-100 disabled:opacity-40"
+              title="清空候选人/匹配/触达数据，岗位配置不受影响"
+            >
+              清理数据库
+            </button>
           </div>
         </div>
         {rerankMsg && (
           <div className="px-4 py-2 text-xs text-indigo-700 bg-indigo-50 border-b border-indigo-100">{rerankMsg}</div>
+        )}
+        {resetMsg && (
+          <div className="px-4 py-2 text-xs text-red-700 bg-red-50 border-b border-red-100">{resetMsg}</div>
         )}
 
         {queueLoading ? (
@@ -191,19 +285,20 @@ export default function Dashboard() {
         ) : (
           <div className="divide-y divide-gray-100">
             {queue.map((item: QueueItem) => (
-              <div key={item.match_id} className="p-4 hover:bg-gray-50 transition-colors">
+              <div
+                key={item.match_id}
+                onClick={() => setSelectedCandidate(item)}
+                className="p-4 hover:bg-gray-50 transition-colors cursor-pointer"
+              >
                 <div className="flex items-start justify-between">
                   <div className="flex-1 min-w-0">
                     <div className="flex items-center gap-2">
-                      <button
-                        onClick={() => setSelectedCandidate(item)}
-                        className="text-sm font-medium text-gray-900 hover:text-blue-600 truncate"
-                      >
+                      <span className="text-sm font-medium text-gray-900 truncate">
                         {item.name}
-                      </button>
+                      </span>
                       <ScoreBadge score={item.score} />
                       {item.llm_score != null && <LlmBadge score={item.llm_score} />}
-                      <StatusBadge status={item.status} />
+                      {view !== 'skipped' && <StatusBadge status={item.status} />}
                       {item.active_status && (
                         <span className="text-xs text-gray-400">{item.active_status}</span>
                       )}
@@ -218,8 +313,24 @@ export default function Dashboard() {
                       <div className="text-xs text-gray-500 mt-0.5 line-clamp-1">{item.match_reason}</div>
                     )}
                     <MissingWarning info={item.missing_info} />
+                    {drafts[item.match_id] && (
+                      <div
+                        className="mt-2 bg-purple-50 border border-purple-100 rounded-lg p-2.5 text-xs text-gray-700 whitespace-pre-wrap"
+                        onClick={e => e.stopPropagation()}
+                      >
+                        {drafts[item.match_id]}
+                        <div className="mt-1.5">
+                          <button
+                            onClick={() => copyDraft(item.match_id, drafts[item.match_id])}
+                            className="px-2 py-0.5 text-xs bg-purple-100 text-purple-700 rounded hover:bg-purple-200"
+                          >
+                            {copiedId === item.match_id ? '已复制' : '复制话术'}
+                          </button>
+                        </div>
+                      </div>
+                    )}
                   </div>
-                  <div className="flex items-center gap-1.5 ml-4 shrink-0">
+                  <div className="flex items-center gap-1.5 ml-4 shrink-0" onClick={e => e.stopPropagation()}>
                     {item.status === 'skipped' ? (
                       <button
                         onClick={() => handleAction(`restore-${item.match_id}`, () => statusMutation.mutateAsync({ matchId: item.match_id, status: 'new' }))}
@@ -261,6 +372,35 @@ export default function Dashboard() {
           </div>
         )}
       </div>
+
+      {pendingBulk && (
+        <ConfirmDialog
+          message={pendingBulk.message}
+          onCancel={() => setPendingBulk(null)}
+          onConfirm={() => {
+            bulkMutation.mutate({ matchIds: pendingBulk.matchIds, status: pendingBulk.status });
+            setPendingBulk(null);
+          }}
+        />
+      )}
+
+      {resetStep === 1 && (
+        <ConfirmDialog
+          message="确认要清空数据库吗？这会删除所有候选人、匹配结果和触达记录（岗位配置保留）。此操作不可恢复。"
+          onCancel={() => setResetStep(0)}
+          onConfirm={() => setResetStep(2)}
+        />
+      )}
+      {resetStep === 2 && (
+        <ConfirmDialog
+          message="再次确认：数据清空后无法找回，确定继续吗？"
+          onCancel={() => setResetStep(0)}
+          onConfirm={() => {
+            setResetStep(0);
+            resetMutation.mutate();
+          }}
+        />
+      )}
     </div>
   );
 }

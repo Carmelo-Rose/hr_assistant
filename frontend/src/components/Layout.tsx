@@ -1,11 +1,31 @@
 import { Outlet, Link, useLocation } from 'react-router-dom';
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import CandidateDetail from './CandidateDetail';
 import type { QueueItem } from '../api';
 
 export default function Layout() {
   const location = useLocation();
   const [selectedCandidate, setSelectedCandidate] = useState<QueueItem | null>(null);
+  const drawerRef = useRef<HTMLDivElement>(null);
+
+  // Close the detail drawer whenever the route changes (e.g. top nav click).
+  useEffect(() => {
+    setSelectedCandidate(null);
+  }, [location.pathname]);
+
+  // Close on click outside the drawer. Uses mousedown (fires before a row's
+  // own click handler) so clicking a different row still switches candidates
+  // instead of being cancelled out by this closing first.
+  useEffect(() => {
+    if (!selectedCandidate) return;
+    const handleMouseDown = (e: MouseEvent) => {
+      if (drawerRef.current && !drawerRef.current.contains(e.target as Node)) {
+        setSelectedCandidate(null);
+      }
+    };
+    document.addEventListener('mousedown', handleMouseDown);
+    return () => document.removeEventListener('mousedown', handleMouseDown);
+  }, [selectedCandidate]);
 
   const navLink = (path: string, label: string) => (
     <Link
@@ -29,8 +49,8 @@ export default function Layout() {
               <h1 className="text-xl font-bold text-gray-900">BOSS 招聘助手</h1>
               <nav className="flex items-center gap-1 ml-8">
                 {navLink('/dashboard', '今日队列')}
-                {navLink('/batch-search', '批量搜索')}
                 {navLink('/jobs', '岗位配置')}
+                {navLink('/onboarding', '安装指引')}
               </nav>
             </div>
           </div>
@@ -41,10 +61,12 @@ export default function Layout() {
       </main>
 
       {selectedCandidate && (
-        <CandidateDetail
-          item={selectedCandidate}
-          onClose={() => setSelectedCandidate(null)}
-        />
+        <div ref={drawerRef}>
+          <CandidateDetail
+            item={selectedCandidate}
+            onClose={() => setSelectedCandidate(null)}
+          />
+        </div>
       )}
     </div>
   );

@@ -56,6 +56,9 @@ def _upsert_match_result(db: Session, candidate, job_id: str, score_result: dict
     ).first()
     if mr:
         mr.score = score_result["score"]
+        mr.age_pass = score_result.get("age_pass", 1)
+        mr.experience_match = score_result.get("experience_match", 1)
+        mr.capability_match = score_result.get("capability_match", 1)
         if mr.status in ("new", "queued"):
             mr.match_reason = reason
     else:
@@ -66,6 +69,9 @@ def _upsert_match_result(db: Session, candidate, job_id: str, score_result: dict
             match_reason=reason,
             missing_info="",
             status="new",
+            age_pass=score_result.get("age_pass", 1),
+            experience_match=score_result.get("experience_match", 1),
+            capability_match=score_result.get("capability_match", 1),
         )
         db.add(mr)
     db.commit()

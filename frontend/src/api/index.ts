@@ -20,6 +20,8 @@ export interface QueueItem {
   active_status: string;
   status: string;
   outreach_id: number | null;
+  llm_score: number | null;
+  llm_reason: string;
 }
 
 export interface Job {
@@ -51,12 +53,6 @@ export interface DraftResult {
   match_id: number;
   draft_text: string;
   status: string;
-}
-
-export interface FillResult {
-  outreach_id: number;
-  filled: boolean;
-  message: string;
 }
 
 export interface BrowserStatus {
@@ -109,8 +105,9 @@ export const captureCurrent = () => api.post<CaptureResult>('/candidates/capture
 
 // Outreach
 export const createDraft = (matchId: number) => api.post<DraftResult>(`/outreach/${matchId}/draft`).then(r => r.data);
-export const fillChat = (matchId: number) => api.post<FillResult>(`/outreach/${matchId}/fill`).then(r => r.data);
 export const updateStatus = (matchId: number, status: string) => api.patch(`/outreach/${matchId}/status`, { status }).then(r => r.data);
+export const bulkUpdateStatus = (matchIds: number[], status: string) =>
+  api.patch<{ updated: number; status: string }>('/outreach/bulk-status', { match_ids: matchIds, status }).then(r => r.data);
 
 // Batch Search
 export const batchSearch = (keywords?: string[], city?: string, count_per_keyword?: number) =>
@@ -130,5 +127,23 @@ export interface SearchProfile {
 }
 
 export const getProfile = () => api.get<SearchProfile>('/config/profile').then(r => r.data);
+
+// LLM 精评（国产模型重排入围名单）
+export interface LlmRerankResult {
+  configured: boolean;
+  scored?: number;
+  total?: number;
+  job_title?: string;
+  message?: string;
+  error?: string;
+}
+
+export const llmRerank = (jobId?: string, limit = 60) =>
+  api.post<LlmRerankResult>('/ext/llm-rerank', { job_id: jobId || null, limit }, { timeout: 180000 })
+    .then(r => r.data);
+
+// 清理数据库（候选人/匹配/触达/页面快照，岗位配置保留）
+export const resetDb = () =>
+  api.delete<{ deleted: Record<string, number> }>('/config/reset-db').then(r => r.data);
 
 export default api;

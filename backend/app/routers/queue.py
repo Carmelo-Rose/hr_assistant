@@ -5,7 +5,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
-from sqlalchemy import desc
+from sqlalchemy import desc, func
 
 from app.models.database import get_db
 from app.models.candidate import Candidate
@@ -31,6 +31,8 @@ class QueueItem(BaseModel):
     active_status: str
     status: str
     outreach_id: int | None = None
+    llm_score: float | None = None
+    llm_reason: str = ""
 
 
 @router.get("/queue/today")
@@ -77,7 +79,8 @@ def get_today_queue(
             OutreachRecord.id.label("outreach_id"),
         )
         .order_by(
-            desc(MatchResult.score),
+            # AI 精评分优先(有就用 llm_score,没有回退规则分),统一 0-100 量纲
+            desc(func.coalesce(MatchResult.llm_score, MatchResult.score)),
             status_order,
         )
         .all()
@@ -107,6 +110,8 @@ def get_today_queue(
             active_status=active_status or "",
             status=mr.status,
             outreach_id=outreach_id,
+            llm_score=mr.llm_score,
+            llm_reason=mr.llm_reason or "",
         ))
 
     return items

@@ -1,0 +1,84 @@
+"""Shared ingestion logic: upsert a Candidate row from scraper dict + score result.
+
+Used by both the Playwright batch-search path and the userscript ext/score path.
+"""
+
+import re
+from typing import Optional
+
+from sqlalchemy.orm import Session
+
+from app.models.candidate import Candidate
+
+
+def _parse_age(raw) -> Optional[int]:
+    if raw is None:
+        return None
+    m = re.search(r"(\d+)", str(raw))
+    return int(m.group(1)) if m else None
+
+
+def upsert_candidate(
+    db: Session,
+    candidate_dict: dict,
+    score_result: dict,
+    source_keyword: str = "",
+) -> Candidate:
+    """Upsert a Candidate from a scraper dict (EXTRACT_CARDS_JS shape).
+
+    - If boss_id/expectId already exists, update mutable fields.
+    - Otherwise insert a new row.
+    - Returns the persisted Candidate object (refreshed).
+    """
+    expect_id = candidate_dict.get("expectId", "") or candidate_dict.get("name", "")
+    if not expect_id:
+        # Fallback: use name + index as a pseudo-ID so we still persist
+        expect_id = candidate_dict.get("name", "unknown")
+
+    existing = db.query(Candidate).filter(
+        Candidate.boss_id == expect_id
+    ).first()
+
+    if existing:
+        # Update mutable fields only
+        existing.salary_range = candidate_dict.get("salary", existing.salary_range)
+        existing.job_status = candidate_dict.get("jobStatus", existing.job_status)
+        existing.expected_city = candidate_dict.get("expectCity", existing.expected_city)
+        existing.company = candidate_dict.get("company", existing.company)
+        existing.title = candidate_dict.get("title", existing.title)
+        existing.major = candidate_dict.get("major", existing.major)
+        parsed_age = _parse_age(candidate_dict.get("age"))
+        if parsed_age is not None:
+            existing.age = parsed_age
+        if candidate_dict.get("fullText"):
+            existing.experience_summary = candidate_dict.get("fullText", "")
+        existing.score = score_result["score"]
+        if source_keyword:
+            existing.source_keyword = source_keyword
+        candidate = existing
+    else:
+        candidate = Candidate(
+            boss_id=expect_id,
+            expect_id=expect_id,
+            name=candidate_dict.get("name", "") or "未知",
+            age=_parse_age(candidate_dict.get("age")),
+            education=candidate_dict.get("education", ""),
+            school=candidate_dict.get("school", ""),
+            work_years=candidate_dict.get("experience", ""),
+            current_company=candidate_dict.get("company", ""),
+            current_position=candidate_dict.get("title", ""),
+            experience_summary=candidate_dict.get("fullText", ""),
+            skills=", ".join(candidate_dict.get("skills", [])),
+            raw_snapshot=candidate_dict.get("fullText", ""),
+            salary_range=candidate_dict.get("salary", ""),
+            job_status=candidate_dict.get("jobStatus", ""),
+            expected_city=candidate_dict.get("expectCity", ""),
+            major=candidate_dict.get("major", ""),
+            score=score_result["score"],
+            source_keyword=source_keyword,
+        )
+        db.add(candidate)
+
+    db.commit()
+    db.refresh(candidate)
+    return candidate

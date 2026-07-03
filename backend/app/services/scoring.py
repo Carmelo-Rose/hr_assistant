@@ -126,6 +126,124 @@ def score_candidate(candidate: Candidate, job: Job) -> dict:
     }
 
 
+# --- Mode 1b: Score a scraper dict against a workbench Job ---
+
+def score_candidate_by_job(candidate: dict, job) -> dict:
+    """Score a scraper dict (EXTRACT_CARDS_JS shape) against a Job's dimensions.
+
+    Uses the job's age_max / experience_keywords / capability_keywords (the
+    fields editable on the 工作台 岗位配置 page) instead of the YAML profile.
+    Returns the same shape as batch_score_candidate: {score, is_blocked, details}.
+    """
+    exp_kws = [k.strip().lower() for k in (job.experience_keywords or "").split(",") if k.strip()]
+    cap_kws = [k.strip().lower() for k in (job.capability_keywords or "").split(",") if k.strip()]
+    age_max = job.age_max or 99
+
+    full_text = candidate.get("fullText", "")
+    skills_text = " ".join(candidate.get("skills", [])).lower()
+    text = " ".join([
+        full_text,
+        skills_text,
+        candidate.get("company", ""),
+        candidate.get("title", ""),
+    ]).lower()
+
+    score = 40
+    details = []
+
+    # Experience keywords (proportional, up to +35)
+    # No keywords configured on the job → nothing to fail, treat as matched.
+    experience_match = 1
+    if exp_kws:
+        hit = [kw for kw in exp_kws if kw in text]
+        if hit:
+            s = int(len(hit) / len(exp_kws) * 35)
+            score += s
+            details.append(f"经验匹配(+{s}): {', '.join(hit)}")
+            experience_match = 1 if len(hit) / len(exp_kws) >= 0.5 else 0
+        else:
+            details.append("经验关键词未匹配")
+            experience_match = 0
+
+    # Capability keywords (proportional, up to +25)
+    capability_match = 1
+    if cap_kws:
+        hit = [kw for kw in cap_kws if kw in skills_text or kw in text]
+        if hit:
+            s = int(len(hit) / len(cap_kws) * 25)
+            score += s
+            details.append(f"能力匹配(+{s}): {', '.join(hit)}")
+            capability_match = 1 if len(hit) / len(cap_kws) >= 0.5 else 0
+        else:
+            details.append("能力关键词未匹配")
+            capability_match = 0
+
+    # Age: within → small bonus, over → hard block. No age found → can't fail it.
+    is_blocked = False
+    age_pass = 1
+    age_m = re.search(r"(\d+)", str(candidate.get("age", "")))
+    if age_m:
+        age = int(age_m.group(1))
+        if age <= age_max:
+            score += 5
+            details.append(f"年龄合格(+5): {age}≤{age_max}")
+        else:
+            is_blocked = True
+            age_pass = 0
+            details.append(f"年龄超限: {age}>{age_max}")
+
+    # Experience years sweet spot
+    exp_m = re.search(r"(\d+)", candidate.get("experience", ""))
+    if exp_m:
+        yrs = int(exp_m.group(1))
+        if 3 <= yrs <= 8:
+            score += 5
+            details.append(f"经验年限(+5): {yrs}年")
+        elif yrs < 2:
+            score -= 5
+            details.append(f"经验不足(-5): {yrs}年")
+
+    # Education
+    edu = candidate.get("education", "")
+    if "博士" in edu:
+        score += 6
+        details.append("博士学历(+6)")
+    elif "硕士" in edu:
+        score += 3
+        details.append("硕士学历(+3)")
+
+    # Activity (parsed from card text)
+    if "刚刚活跃" in full_text or "今日活跃" in full_text:
+        score += 8
+        details.append("活跃度(+8): 刚刚/今日活跃")
+    elif "本周活跃" in full_text or "3日内" in full_text or "昨日活跃" in full_text:
+        score += 5
+        details.append("活跃度(+5): 近期活跃")
+
+    # Availability
+    status = candidate.get("jobStatus", "")
+    if "离职" in status:
+        score += 4
+        details.append("离职可到岗(+4)")
+    elif "月内" in status:
+        score += 2
+        details.append("月内到岗(+2)")
+    if "暂不考虑" in status:
+        is_blocked = True
+        details.append("状态排除(暂不考虑)")
+
+    score = max(0, min(100, score))
+    return {
+        "score": score,
+        "is_blocked": is_blocked,
+        "details": details,
+        "summary": f"按「{job.title}」评分 {score}/100",
+        "age_pass": age_pass,
+        "experience_match": experience_match,
+        "capability_match": capability_match,
+    }
+
+
 # --- Mode 2: Batch scoring from search results (dict-based) ---
 
 def batch_score_candidate(candidate: dict, profile: Optional[dict] = None) -> dict:

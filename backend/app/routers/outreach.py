@@ -16,7 +16,12 @@ router = APIRouter()
 
 
 class OutreachStatusPatch(BaseModel):
-    status: str  # sent_manual | skipped
+    status: str  # sent_manual | skipped | new
+
+
+class BulkStatusPatch(BaseModel):
+    match_ids: list[int]
+    status: str  # sent_manual | skipped | new
 
 
 @router.post("/outreach/{match_id}/draft")
@@ -138,8 +143,8 @@ async def fill_chat_box(match_id: int, db: Session = Depends(get_db)):
 
 @router.patch("/outreach/{match_id}/status")
 def update_outreach_status(match_id: int, patch: OutreachStatusPatch, db: Session = Depends(get_db)):
-    """Mark outreach as sent_manual or skipped."""
-    valid = {"sent_manual", "skipped"}
+    """Mark outreach as sent_manual, skipped, or restore it back to new."""
+    valid = {"sent_manual", "skipped", "new"}
     if patch.status not in valid:
         raise HTTPException(status_code=400, detail=f"Status must be one of {valid}")
 
@@ -156,3 +161,23 @@ def update_outreach_status(match_id: int, patch: OutreachStatusPatch, db: Sessio
     db.commit()
 
     return {"match_id": match_id, "status": patch.status}
+
+
+@router.patch("/outreach/bulk-status")
+def bulk_update_outreach_status(patch: BulkStatusPatch, db: Session = Depends(get_db)):
+    """Bulk skip or restore-to-queue for a set of match ids (一键跳过 / 一键恢复队列)."""
+    valid = {"sent_manual", "skipped", "new"}
+    if patch.status not in valid:
+        raise HTTPException(status_code=400, detail=f"Status must be one of {valid}")
+    if not patch.match_ids:
+        return {"updated": 0, "status": patch.status}
+
+    db.query(MatchResult).filter(MatchResult.id.in_(patch.match_ids)).update(
+        {"status": patch.status}, synchronize_session=False
+    )
+    db.query(OutreachRecord).filter(OutreachRecord.match_id.in_(patch.match_ids)).update(
+        {"status": patch.status}, synchronize_session=False
+    )
+    db.commit()
+
+    return {"updated": len(patch.match_ids), "status": patch.status}

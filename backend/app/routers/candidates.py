@@ -1,7 +1,6 @@
 """Capture candidate from BOSS current page via Playwright + batch search."""
 
 import logging
-import re
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -16,17 +15,10 @@ from app.models.job import Job
 from app.services.scoring import score_candidate, batch_score_candidate, load_profile
 from app.services.browser import get_browser_context
 from app.services.boss_scraper import search_candidates, multi_search
+from app.services.ingest import upsert_candidate
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
-
-
-def _parse_age(raw) -> Optional[int]:
-    """Parse an int age from scraper strings like '28岁'; None if unparseable."""
-    if raw is None:
-        return None
-    m = re.search(r"(\d+)", str(raw))
-    return int(m.group(1)) if m else None
 
 
 class CaptureResult(BaseModel):
@@ -210,8 +202,11 @@ async def batch_search_candidates(
     if raw_candidates and "error" in raw_candidates[0]:
         raise HTTPException(status_code=500, detail=raw_candidates[0]["error"])
 
-    # Score & store
+    # Score & store via shared ingest
     scored = []
+    existing_ids = set(
+        row[0] for row in db.query(Candidate.boss_id).all()
+    )
     new_count = 0
     for c in raw_candidates:
         score_result = batch_score_candidate(c, profile)
@@ -221,53 +216,14 @@ async def batch_search_candidates(
         scored.append(c)
 
         expect_id = c.get("expectId", "") or c.get("name", "")
-        if not expect_id:
-            continue
-
-        existing = db.query(Candidate).filter(
-            Candidate.boss_id == expect_id
-        ).first()
-        if existing:
-            existing.salary_range = c.get("salary", existing.salary_range)
-            existing.job_status = c.get("jobStatus", existing.job_status)
-            existing.expected_city = c.get("expectCity", existing.expected_city)
-            existing.company = c.get("company", existing.company)
-            existing.title = c.get("title", existing.title)
-            existing.major = c.get("major", existing.major)
-            parsed_age = _parse_age(c.get("age"))
-            if parsed_age is not None:
-                existing.age = parsed_age
-            if c.get("fullText"):
-                existing.experience_summary = c.get("fullText", "")
-            existing.score = score_result["score"]
-            existing.source_keyword = c.get("_source_keyword", existing.source_keyword)
-            continue
-
-        name = c.get("name", "")
-        candidate = Candidate(
-            boss_id=expect_id,
-            expect_id=expect_id,
-            name=name or "未知",
-            age=_parse_age(c.get("age")),
-            education=c.get("education", ""),
-            school=c.get("school", ""),
-            work_years=c.get("experience", ""),
-            current_company=c.get("company", ""),
-            current_position=c.get("title", ""),
-            experience_summary=c.get("fullText", ""),
-            skills=", ".join(c.get("skills", [])),
-            raw_snapshot=c.get("fullText", ""),
-            salary_range=c.get("salary", ""),
-            job_status=c.get("jobStatus", ""),
-            expected_city=c.get("expectCity", ""),
-            major=c.get("major", ""),
-            score=score_result["score"],
+        is_new = expect_id not in existing_ids
+        upsert_candidate(
+            db, c, score_result,
             source_keyword=c.get("_source_keyword", ""),
         )
-        db.add(candidate)
-        new_count += 1
-
-    db.commit()
+        if is_new:
+            new_count += 1
+            existing_ids.add(expect_id)
 
     # Sort by score desc
     scored.sort(key=lambda x: x["_score"], reverse=True)

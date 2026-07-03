@@ -1,5 +1,5 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query';
-import { createDraft, fillChat, updateStatus, type QueueItem } from '../api';
+import { createDraft, updateStatus, type QueueItem } from '../api';
 
 interface Props {
   item: QueueItem;
@@ -11,11 +11,6 @@ export default function CandidateDetail({ item, onClose }: Props) {
 
   const draftMutation = useMutation({
     mutationFn: () => createDraft(item.match_id),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['queue'] }),
-  });
-
-  const fillMutation = useMutation({
-    mutationFn: () => fillChat(item.match_id),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['queue'] }),
   });
 
@@ -99,13 +94,6 @@ export default function CandidateDetail({ item, onClose }: Props) {
               className="flex-1 px-3 py-2 text-sm bg-purple-600 text-white rounded-lg hover:bg-purple-700 disabled:opacity-40"
             >
               生成话术
-            </button>
-            <button
-              onClick={() => fillMutation.mutate()}
-              disabled={!['drafted', 'filled'].includes(item.status)}
-              className="flex-1 px-3 py-2 text-sm bg-teal-600 text-white rounded-lg hover:bg-teal-700 disabled:opacity-40"
-            >
-              填入输入框
             </button>
           </div>
           <div className="flex gap-2">

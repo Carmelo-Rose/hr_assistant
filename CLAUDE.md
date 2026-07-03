@@ -45,59 +45,98 @@ cd frontend && npm run build
 cd frontend && npm run lint
 ```
 
-### Before running: connect Chrome
+### Daily usage (userscript flow — primary)
 
-```bash
-# Chrome v120+ requires --user-data-dir when enabling remote debugging.
-# Using the backend's profile dir so BOSS login cookies persist across restarts.
-/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome \
-  --remote-debugging-port=9222 \
-  --user-data-dir="$(pwd)/backend/data/browser_profile" \
-  --no-first-run
+The reliable path is a **Tampermonkey userscript** (`userscript/boss-helper.user.js`)
+running inside your own logged-in Chrome. BOSS anti-bot trusts a real browser, and
+the script can click the real 打招呼 button. **No Playwright/CDP needed.**
 
-# Verify the port is open:
-curl http://127.0.0.1:9222/json/version
+1. **Start the backend** (it also serves the dashboard *and* the userscript):
+   - macOS: double-click `start.command`
+   - Windows: double-click `start.bat`
+   - or manually: `cd backend && uv run uvicorn app.main:app --port 8000`
+   - This opens `http://localhost:8000` — the workbench / 复盘台.
+2. **One-time install** (the `/onboarding` "安装指引" page walks through it):
+   - Install Tampermonkey from the Chrome Web Store.
+   - Open `http://localhost:8000/boss-helper.user.js` → Tampermonkey one-click install.
+     The script's `@updateURL`/`@downloadURL` point back here, so future edits
+     auto-update — no more pasting the whole file.
+3. **Work**: log into your BOSS recruiter account, open the talent search/recommend
+   page. The "BOSS 招聘助手" panel appears on the right: pick a 岗位 → 扫描列表 →
+   半自动/自动打招呼. Already-greeted candidates are greyed out and auto-skipped.
 
-# Then connect backend to it:
-curl -X POST http://localhost:8000/api/browser/start
-```
+Build the dashboard once so the backend can serve it: `cd frontend && npm run build`
+(produces `frontend/dist`). After that `npm run dev` is not needed for daily use.
 
-Or set `BOSS_CDP_URL` in `backend/.env` to override the default port.
+The userscript talks to the backend under `/api/ext/*` (see `routers/ext.py`):
+`/score` (per-job scoring + already-contacted flag), `/jobs` (job picker),
+`/llm-draft` (personalized greeting), `/llm-rerank` (AI 精评), `/log-greeting`.
+
+#### Legacy: Playwright/CDP path (deprecated)
+
+`browser.py` + `boss_scraper.py` attach to a manually-launched debug Chrome via
+CDP. BOSS bounces Playwright-launched pages to `about:blank`, so this is **no
+longer the main flow** — the userscript replaced it. The `/api/browser/*` and
+`/outreach/{id}/fill` endpoints remain only for that legacy path; the dashboard no
+longer exposes the "填入输入框" button that depended on it.
 
 ## Architecture
 
 ```
+start.command / start.bat   # One-click launcher: start backend + open localhost:8000
+userscript/
+  boss-helper.user.js   # Tampermonkey script: scan/score/greet inside real Chrome (primary data path)
 backend/
   app/
-    main.py              # FastAPI app, lifespan seeds 4 default jobs into SQLite
-    models/              # SQLAlchemy ORM: Candidate, Job, Outreach, MatchResult, PageSnapshot
-    routers/             # Route handlers: browser, candidates, jobs, outreach, queue
+    main.py              # FastAPI app; serves /boss-helper.user.js + built frontend; lifespan seeds jobs + sqlite migration
+    models/              # SQLAlchemy ORM: Candidate, Job, Outreach, MatchResult (+llm_score/llm_reason), PageSnapshot
+    routers/             # browser(legacy), candidates(legacy), jobs, outreach(legacy fill), queue, config, ext(userscript API)
     services/
-      browser.py         # Singleton CDP browser manager (module-level _context)
-      boss_scraper.py    # Playwright scraping: JS injection to parse BOSS SPA card lists
-      scoring.py         # Two-mode scoring engine (see below)
-      templating.py      # Outreach message template rendering
+      ingest.py          # upsert_candidate: shared Candidate upsert from scraper dict (userscript + legacy)
+      scoring.py         # Rule-based scoring: score_candidate / score_candidate_by_job / batch_score_candidate
+      llm_scoring.py     # 国产 OpenAI-compatible LLM: score_candidates (AI 精评) + draft_greeting (个性化话术)
+      templating.py      # Static template fallback for outreach drafts (render_draft)
+      browser.py         # LEGACY Playwright/CDP manager
+      boss_scraper.py    # LEGACY Playwright scraping
   config/
-    search_profile.yaml  # Job search keywords + scoring weights (edit to customize)
+    search_profile.yaml  # Default/global keywords + scoring weights (per-job dims live on the Job row)
   data/
-    boss_hr.db           # SQLite database (auto-created)
+    boss_hr.db           # SQLite database (auto-created + auto-migrated)
 frontend/
   src/
-    App.tsx              # Router: /dashboard → Dashboard, /jobs → JobConfig
-    pages/               # Dashboard (today's queue) and JobConfig (edit jobs)
+    App.tsx              # Router: /dashboard, /jobs, /onboarding
+    pages/               # Dashboard (queue/复盘 + AI精评), JobConfig (edit jobs), Onboarding (install guide)
     components/          # Layout and shared UI
 ```
 
+### Userscript ↔ backend (primary flow)
+
+`userscript/boss-helper.user.js` (Tampermonkey, served from
+`http://localhost:8000/boss-helper.user.js`) runs in the recruiter's real Chrome on
+`zhipin.com`. It scans `li.geek-info-card` cards, POSTs them to `/api/ext/score`
+(scored against the selected workbench Job via `score_candidate_by_job`; returns
+`already_contacted` so contacted people are greyed/skipped), badges each card, and
+in semi-/auto mode fetches a personalized greeting from `/api/ext/llm-draft` before
+filling the chat box. Sent greetings are logged via `/api/ext/log-greeting`.
+
 ### Browser singleton
 
-`browser.py` holds a module-level `_context: BrowserContext` (not a class). `get_browser_context()` returns it synchronously; `start_browser()` tries 4 strategies in order: configured CDP URL → auto-detect ports 9222/9229/19222 → launch system Chrome → bare Chromium fallback. Call `POST /api/browser/start` before any scraping.
+`browser.py` holds a module-level `_context: BrowserContext` (not a class). `get_browser_context()` returns it synchronously. `start_browser()` default path is `_connect_via_cdp()` — attach to a manually-launched Chrome (configured `BOSS_CDP_URL` → auto-detect ports 9222/9229/19222), which BOSS anti-bot trusts. If CDP is unreachable it falls back to `_launch_persistent_chromium()` (bundled Chromium, persistent profile at `data/pw_profile`) and returns a warning steering the user back to CDP, because automation-launched browsers get bounced to about:blank by BOSS. `BOSS_FORCE_BUNDLED=1` skips CDP. Call `POST /api/browser/start` before any scraping.
 
 ### Scoring engine (`scoring.py`)
 
-Two distinct modes — don't mix them:
+Rule-based modes — don't mix them:
 
-- **`score_candidate(candidate: Candidate, job: Job)`** — one-to-one match using ORM objects; used in the per-candidate outreach flow. Scores age (20), experience keywords (40), capability keywords (30), active status (10).
-- **`batch_score_candidate(candidate: dict, profile: dict)`** — batch mode using raw dicts from scraper output; driven by `search_profile.yaml`. Starts at base 50, adds/subtracts points for domain/tech/bonus keywords, education, salary, experience years, job status.
+- **`score_candidate_by_job(candidate: dict, job: Job)`** — **the userscript path** (`/api/ext/score`). Scores a scraper dict against the selected workbench Job's `experience_keywords` / `capability_keywords` / `age_max`. Per-job, no YAML needed.
+- **`batch_score_candidate(candidate: dict, profile: dict)`** — YAML-driven fallback (`search_profile.yaml` domain/tech/bonus keywords). Used only when no Job exists.
+- **`score_candidate(candidate: Candidate, job: Job)`** — legacy one-to-one ORM match for the deprecated outreach flow.
+
+**AI 精评 (LLM rerank, optional):** `llm_scoring.py` calls a 国产 OpenAI-compatible
+model (DeepSeek/Qwen/GLM/Kimi via `LLM_*` env in `backend/.env`) to re-score the
+shortlist (`/api/ext/llm-rerank`, "AI 精评" button) into `MatchResult.llm_score/llm_reason`;
+the queue orders by `coalesce(llm_score, score)`. The same client powers
+`draft_greeting` (personalized outreach via `/api/ext/llm-draft`), which falls back
+to the static `render_draft` template when `LLM_*` is unset.
 
 ### Scraper (`boss_scraper.py`)
 

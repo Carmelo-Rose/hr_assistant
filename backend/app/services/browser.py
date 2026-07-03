@@ -1,22 +1,28 @@
-"""Persistent browser manager using CDP to connect to existing Chrome.
+"""Browser manager for BOSS scraping.
 
-Strategies (in order):
-1. Connect to user-specified CDP URL (BOSS_CDP_URL env)
-2. Auto-detect Chrome debug port on common ports
-3. Launch system Chrome with debug port + dedicated profile
-4. Fallback: bare Chromium (last resort)
+Default: attach via CDP to a Chrome the user launched manually with
+--remote-debugging-port. A normally-launched Chrome (real profile, no automation
+flags) is what BOSS's anti-bot trusts — verified working against Chrome 149.
+
+Fallback: Playwright's bundled Chromium with a persistent profile
+(`data/pw_profile`). Convenient and version-matched, but it is an
+automation-launched browser, so BOSS may flag it and bounce pages to
+about:blank. Set BOSS_FORCE_BUNDLED=1 to skip CDP and use it directly.
+
+Note on the `Browser.setDownloadBehavior: Browser context management is not
+supported` error some users hit on connect: it stems from attaching to an
+already-running multi-window Chrome. Fully quit Chrome first, then launch a
+clean dedicated debug instance.
 """
 
 import asyncio
 import json
 import logging
 import os
-import subprocess
-import platform
 import random
 from typing import Optional
 
-from playwright.async_api import async_playwright, BrowserContext, Page
+from playwright.async_api import async_playwright, BrowserContext
 
 logger = logging.getLogger(__name__)
 
@@ -29,8 +35,18 @@ DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "data")
 COOKIES_DIR = os.path.join(DATA_DIR, "browser_cookies")
 COOKIES_FILE = os.path.join(COOKIES_DIR, "boss_cookies.json")
 CHROME_PROFILE_DIR = os.path.join(DATA_DIR, "browser_profile")
+# Profile for Playwright's own bundled Chromium (version-matched, robust against
+# system Chrome auto-updates). This is the default working path.
+PW_PROFILE_DIR = os.path.join(DATA_DIR, "pw_profile")
 CDP_DETECT_PORTS = [9222, 9229, 19222]
 CDP_URL_ENV = os.environ.get("BOSS_CDP_URL", "http://localhost:9222")
+# Default path is CDP: attach to a Chrome the user launched manually with
+# --remote-debugging-port. A normally-launched Chrome (real profile, no
+# automation flags) is what BOSS's anti-bot trusts. Playwright-LAUNCHED browsers
+# (bundled Chromium or even channel="chrome") get flagged and bounced to
+# about:blank, so the bundled-Chromium path is only a fallback. Set
+# BOSS_FORCE_BUNDLED=1 to skip CDP and go straight to bundled Chromium.
+FORCE_BUNDLED = os.environ.get("BOSS_FORCE_BUNDLED", "").strip().lower() in ("1", "true", "yes")
 
 MIN_DELAY = 1.5
 MAX_DELAY = 4.0
@@ -61,43 +77,6 @@ async def _try_cdp_connect(url: str) -> tuple[bool, str]:
         return False, err
 
 
-async def _launch_system_chrome() -> Optional[int]:
-    """Launch system Chrome with --remote-debugging-port using dedicated profile."""
-    system = platform.system()
-    if system == "Darwin":
-        chrome_path = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-    elif system == "Linux":
-        chrome_path = "google-chrome"
-    elif system == "Windows":
-        chrome_path = r"C:\Program Files\Google Chrome\Application\chrome.exe"
-    else:
-        return None
-
-    port = 9222
-    os.makedirs(CHROME_PROFILE_DIR, exist_ok=True)
-
-    try:
-        subprocess.Popen(
-            [chrome_path, f"--remote-debugging-port={port}",
-             f"--user-data-dir={CHROME_PROFILE_DIR}"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        for _ in range(20):
-            await asyncio.sleep(1)
-            try:
-                import urllib.request
-                urllib.request.urlopen(f"http://localhost:{port}/json/version", timeout=2)
-                return port
-            except Exception:
-                continue
-    except FileNotFoundError:
-        logger.warning("Chrome not found at %s", chrome_path)
-    except Exception as e:
-        logger.warning("Failed to launch system Chrome: %s", e)
-    return None
-
-
 async def _load_cookies(ctx: BrowserContext):
     if os.path.exists(COOKIES_FILE):
         try:
@@ -119,10 +98,16 @@ async def _save_cookies(ctx: BrowserContext):
 
 
 async def start_browser(user_data_dir: str = CHROME_PROFILE_DIR, headless: bool = False) -> tuple:
-    """Connect to Chrome via CDP. Falls back to launching a new instance.
+    """Start a browser for BOSS scraping.
 
-    Returns (success, message, warning) — warning is non-empty when we fell
-    back to launching a fresh Chrome instead of attaching to an existing one.
+    Default path attaches via CDP to a Chrome the user launched manually with
+    --remote-debugging-port. That is a normal, non-automated Chrome, which BOSS's
+    anti-bot trusts. If no such Chrome is reachable, it falls back to Playwright's
+    bundled Chromium (convenient, but BOSS may flag it). Set BOSS_FORCE_BUNDLED=1
+    to skip CDP entirely.
+
+    Returns (success, message, warning) — warning is non-empty when something
+    needs the user's attention (CDP unreachable / not logged in to BOSS).
     """
     global _context, _playwright, _is_owned_browser
 
@@ -135,27 +120,42 @@ async def start_browser(user_data_dir: str = CHROME_PROFILE_DIR, headless: bool 
 
     _playwright = await async_playwright().start()
 
+    # Preferred: attach to the user's manually-launched Chrome via CDP.
+    cdp_error = ""
+    if not FORCE_BUNDLED:
+        ok, msg, cdp_error = await _connect_via_cdp()
+        if ok:
+            return True, msg, ""
+
+    # Fallback: Playwright's bundled Chromium (auto, but anti-bot may bounce it).
+    return await _launch_persistent_chromium(headless=headless, cdp_error=cdp_error)
+
+
+async def _connect_via_cdp() -> tuple:
+    """Try every CDP candidate. Returns (ok, message, warning)."""
     cdp_errors: list[str] = []
 
-    # Strategy 1: configured CDP URL (localhost + 127.0.0.1 variants)
     cdp_candidates = [CDP_URL_ENV]
     # Also try 127.0.0.1 — some systems resolve "localhost" to IPv6 ::1 but
     # Chrome only binds to IPv4 127.0.0.1, causing connection refused.
     if "localhost" in CDP_URL_ENV:
         cdp_candidates.append(CDP_URL_ENV.replace("localhost", "127.0.0.1"))
+
+    seen = set()
     for url in cdp_candidates:
+        seen.add(url)
         ok, err = await _try_cdp_connect(url)
         if ok:
             return True, f"Connected via CDP: {url}", ""
         if err:
             cdp_errors.append(f"{url}: {err}")
 
-    # Strategy 2: auto-detect common ports (both localhost and 127.0.0.1)
     for port in CDP_DETECT_PORTS:
         for host in ("localhost", "127.0.0.1"):
             url = f"http://{host}:{port}"
-            if url in cdp_candidates:
+            if url in seen:
                 continue
+            seen.add(url)
             ok, err = await _try_cdp_connect(url)
             if ok:
                 return True, f"Auto-detected Chrome at {url}", ""
@@ -163,46 +163,80 @@ async def start_browser(user_data_dir: str = CHROME_PROFILE_DIR, headless: bool 
                 cdp_errors.append(f"{url}: {err}")
 
     error_detail = "\n".join(cdp_errors[:3]) if cdp_errors else "连接超时或被拒绝"
-    _FALLBACK_WARNING = (
-        f"无法连接到已有 Chrome 的调试端口，已启动一个全新的 Chrome 窗口。\n"
-        f"这个新窗口没有你的 BOSS 登录态，搜索功能将无法使用。\n\n"
-        f"连接失败原因：{error_detail}\n\n"
-        f"正确做法（在终端执行以下命令）：\n"
+    logger.warning("CDP connect failed, falling back to bundled Chromium:\n%s", error_detail)
+    return False, "", error_detail
+
+
+async def _launch_persistent_chromium(headless: bool = False, cdp_error: str = "") -> tuple:
+    """Launch Playwright's bundled Chromium with a persistent profile.
+
+    Fallback path used when CDP attach is unavailable. Login state lives in
+    PW_PROFILE_DIR and survives restarts. Note: BOSS anti-bot may flag a
+    Playwright-launched browser (bouncing pages to about:blank); the CDP path
+    (attach to a manually-launched Chrome) is the reliable one, so we surface a
+    hint to switch to it.
+    """
+    global _context, _is_owned_browser
+
+    os.makedirs(PW_PROFILE_DIR, exist_ok=True)
+    _context = await _playwright.chromium.launch_persistent_context(
+        PW_PROFILE_DIR,
+        headless=headless,
+        viewport={"width": 1440, "height": 900},
+        locale="zh-CN",
+        args=["--disable-blink-features=AutomationControlled"],
+    )
+    _is_owned_browser = True
+
+    page = _context.pages[0] if _context.pages else await _context.new_page()
+    # Land on the dedicated login page and nothing else. Crucially we never open
+    # the recruiter app (/web/boss/recommend) on startup: on a not-yet-
+    # authenticated profile that runs a security-check that plants a half-session
+    # and sends the window bouncing between login and app — which is exactly what
+    # makes logging in impossible. The login page itself is safe in both states:
+    # an already-authenticated session gets redirected from it into the app,
+    # while an unauthenticated one shows the QR / code login form.
+    final_url = ""
+    try:
+        await page.goto("https://login.zhipin.com/", wait_until="domcontentloaded", timeout=20000)
+        await page.wait_for_timeout(3000)  # give a logged-in redirect a chance to fire
+        final_url = page.url
+    except Exception as e:
+        logger.debug("Login-page navigation skipped: %s", e)
+
+    # Only treat it as logged-in when we clearly landed inside the app. Anything
+    # else (still on login page, blank, error) -> show the login hint. Detecting
+    # BOSS login programmatically is unreliable (anti-bot redirects), so we bias
+    # toward telling the user to log in rather than silently claiming success.
+    logged_in = "zhipin.com/web/" in final_url and "login" not in final_url
+
+    # Build the fallback warning. The bundled Chromium is automation-launched, so
+    # BOSS may bounce its pages to about:blank — steer the user to the CDP path.
+    cdp_line = f"（CDP 连接失败：{cdp_error.splitlines()[0]}）\n" if cdp_error else ""
+    recommend_cdp = (
+        "建议改用更稳的方式：先【完全退出】Chrome（⌘Q，确保没有任何 Chrome 窗口），再用调试端口启动一个干净实例：\n"
         f"/Applications/Google\\ Chrome.app/Contents/MacOS/Google\\ Chrome \\\n"
         f"  --remote-debugging-port=9222 \\\n"
         f"  --user-data-dir=\"{CHROME_PROFILE_DIR}\" \\\n"
-        f"  --no-first-run\n\n"
-        f"注意：Chrome v120+ 必须指定 --user-data-dir 才能开启远程调试，缺少该参数会导致端口无法绑定。\n"
-        f"启动后在新 Chrome 窗口里登录 BOSS，再回来点击「启动浏览器」。\n\n"
-        f"验证端口：curl http://127.0.0.1:9222/json/version（应返回 JSON）"
+        f"  --no-first-run\n"
+        "在那个窗口登录 BOSS 招聘账号，再回来点「启动浏览器」。手动启动的普通 Chrome 不会被反爬识别。"
     )
 
-    # Strategy 3: launch system Chrome with debug port
-    logger.warning("CDP port not available, falling back to launching system Chrome")
-    port = await _launch_system_chrome()
-    if port:
-        for host in ("127.0.0.1", "localhost"):
-            url = f"http://{host}:{port}"
-            ok, _ = await _try_cdp_connect(url)
-            if ok:
-                _is_owned_browser = True
-                return True, f"Launched system Chrome at port {port}", _FALLBACK_WARNING
+    if logged_in:
+        # Even if it looks logged-in, the bundled browser is fragile against
+        # anti-bot, so still nudge toward CDP.
+        return True, "已启动内置 Chromium（已是登录态）", (
+            "已用内置 Chromium 连接（登录态已就绪）。\n"
+            "注意：内置 Chromium 是自动化浏览器，BOSS 反爬可能在使用中把页面弹回 about:blank。\n"
+            + recommend_cdp
+        )
 
-    # Strategy 4: bare Chromium (last resort)
-    logger.warning("Falling back to bare Chromium (user must log in)")
-    browser = await _playwright.chromium.launch(
-        headless=headless,
-        args=["--disable-blink-features=AutomationControlled"],
+    warning = (
+        "已回退到内置 Chromium。" + cdp_line +
+        "内置 Chromium 是自动化浏览器，BOSS 反爬可能把页面弹回 about:blank、导致无法登录或采集。\n\n"
+        + recommend_cdp
     )
-    _context = await browser.new_context(
-        viewport={"width": 1440, "height": 900},
-        locale="zh-CN",
-    )
-    await _load_cookies(_context)
-    page = await _context.new_page()
-    await page.goto("https://www.zhipin.com", wait_until="domcontentloaded")
-    _is_owned_browser = True
-    return True, "Bare Chromium started (please log in to BOSS)", _FALLBACK_WARNING
+    return True, "已启动内置 Chromium（回退方案，建议改用 CDP）", warning
 
 
 async def _check_context_alive(ctx: BrowserContext) -> bool:
@@ -238,22 +272,18 @@ async def _stop_browser():
     global _context, _playwright, _is_owned_browser
     if _context:
         await _save_cookies(_context)
-        if not _is_owned_browser:
-            try:
-                await _context.close()
-            except Exception:
-                pass
+        # Always close the context: for the persistent (owned) browser this
+        # shuts Chromium down and releases the profile-dir lock; for a CDP
+        # attachment it just detaches.
+        try:
+            await _context.close()
+        except Exception:
+            pass
     if _playwright:
-        if _is_owned_browser:
-            try:
-                await _playwright.stop()
-            except Exception:
-                pass
-        else:
-            try:
-                await _playwright.stop()
-            except Exception:
-                pass
+        try:
+            await _playwright.stop()
+        except Exception:
+            pass
     _context = None
     _playwright = None
     _is_owned_browser = False

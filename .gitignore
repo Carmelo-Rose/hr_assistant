@@ -6,6 +6,12 @@ __pycache__/
 data/*.sqlite3
 data/playwright-profile/
 data/browser_profile/
+# Browser profiles / local data live under backend/data/ (paths above are root-anchored and don't match)
+backend/data/playwright-profile/
+backend/data/browser_profile/
+backend/data/pw_profile/
+backend/data/browser_cookies/
+backend/data/*.db
 frontend/node_modules/
 frontend/dist/
 *.egg-info/

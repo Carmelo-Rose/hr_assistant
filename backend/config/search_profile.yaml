@@ -53,3 +53,12 @@ scoring:
     - "从0到1"
     - "搭建"
     - "团队管理"
+
+greeting:
+  template: "您好，看到您在{company}的{title}经历，我们有{job_title}机会想和您聊聊"
+
+automation:
+  score_threshold: 70
+  daily_cap: 50
+  delay_min_s: 5
+  delay_max_s: 15
