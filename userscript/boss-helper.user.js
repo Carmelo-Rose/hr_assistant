@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BOSS 招聘助手 — 油猴版
 // @namespace    https://github.com/hr_assistant
-// @version      1.14.0
+// @version      1.16.0
 // @description  在 BOSS 直聘页面内扫描候选人、评分、辅助/自动打招呼
 // @match        https://www.zhipin.com/*
 // @noframes
@@ -27,6 +27,9 @@
 
   // ─── Configuration ────────────────────────────────────────────────
   const BACKEND = 'http://localhost:8000/api/ext';
+  // `li.card-item` = 新版推荐/沟通页卡片（2026-07 起）；`li.geek-info-card` = 旧版人才库搜索页卡片。
+  // 两个选择器并存，哪个页面用哪套 DOM 就匹配哪个。
+  const CARD_SEL = 'li.card-item, li.geek-info-card';
 
   // ─── State ────────────────────────────────────────────────────────
   const state = {
@@ -110,11 +113,17 @@
   function extractCards() {
     // Try each accessible document (main page + same-origin iframes)
     for (const doc of getAllDocs()) {
-      const cards = doc.querySelectorAll('li.geek-info-card');
+      const cards = doc.querySelectorAll(CARD_SEL);
       if (!cards.length) continue;
       return _extractFromCards(cards);
     }
     return [];
+  }
+
+  // Candidate identity: old DOM used `a[data-contact][data-expect]`; new DOM
+  // (li.card-item) puts it on `.card-inner[data-geek]` instead. Try both.
+  function getGeekIdEl(card) {
+    return card.querySelector('a[data-contact]') || card.querySelector('[data-geek],[data-geekid]');
   }
 
   function _extractFromCards(cards) {
@@ -123,7 +132,7 @@
     for (let idx = 0; idx < cards.length; idx++) {
       const card = cards[idx];
       const text = card.innerText || '';
-      const link = card.querySelector('a[data-contact]');
+      const idEl = getGeekIdEl(card);
       const lines = text.split('\n').map(l => l.trim()).filter(l => l);
 
       const name = lines[0] || '未知';
@@ -167,9 +176,11 @@
         major = lines[eduIdx + 2] || '';
       }
 
-      const expectId = link ? link.getAttribute('data-expect') : '';
-      const lid = link ? link.getAttribute('data-lid') : '';
-      const jid = link ? link.getAttribute('data-jid') : '';
+      const expectId = idEl
+        ? (idEl.getAttribute('data-expect') || idEl.getAttribute('data-geek') || idEl.getAttribute('data-geekid') || '')
+        : '';
+      const lid = idEl ? (idEl.getAttribute('data-lid') || '') : '';
+      const jid = idEl ? (idEl.getAttribute('data-jid') || '') : '';
 
       results.push({
         index: idx, name, age, experience, education, jobStatus, salary,
@@ -278,10 +289,40 @@
     let scrollContainer = '（无卡片）';
     const cardDoc = getCardDoc();
     if (cardDoc) {
-      const firstCard = cardDoc.querySelector('li.geek-info-card');
+      const firstCard = cardDoc.querySelector(CARD_SEL);
       const sc = scrollableAncestor(firstCard);
       if (sc) {
         scrollContainer = `${sc.tagName.toLowerCase()} | class="${sc.getAttribute('class') || ''}" | scrollH=${sc.scrollHeight} clientH=${sc.clientHeight}`;
+      }
+    }
+
+    // 6) Full HTML dump for the most likely per-candidate card class (any class
+    //    whose element count is close to the visible candidate count), so we can
+    //    redesign the extractor when `li.geek-info-card` no longer matches.
+    const cardHtmlSamples = {};
+    const probeClasses = candidateClasses
+      .filter(([k, v]) => v >= 5 && v <= 40 && /card|item|wrap/i.test(k))
+      .slice(0, 10)
+      .map(([k]) => k);
+    outer2: for (const k of probeClasses) {
+      for (let di = 0; di < allDocs.length; di++) {
+        const el = allDocs[di].querySelector('.' + CSS.escape(k));
+        if (!el) continue;
+        const dataAttrs = [];
+        el.querySelectorAll('*').forEach(child => {
+          for (const attr of child.attributes || []) {
+            if (attr.name.startsWith('data-')) dataAttrs.push(`${child.tagName.toLowerCase()}[${attr.name}="${attr.value}"]`);
+          }
+        });
+        for (const attr of el.attributes || []) {
+          if (attr.name.startsWith('data-')) dataAttrs.push(`SELF[${attr.name}="${attr.value}"]`);
+        }
+        cardHtmlSamples[k] = {
+          doc: di === 0 ? 'main' : `iframe[${di - 1}]`,
+          outerHTML: (el.outerHTML || '').slice(0, 3000),
+          dataAttrs: dataAttrs.slice(0, 20),
+        };
+        if (Object.keys(cardHtmlSamples).length >= 6) break outer2;
       }
     }
 
@@ -296,6 +337,7 @@
       sampleContainer: sampleSel,
       sampleDoc,
       sampleSkeleton: skeleton,
+      cardHtmlSamples,
     };
     const text = 'BOSS-DIAG\n' + JSON.stringify(report, null, 2);
     try { GM_setClipboard(text); } catch (e) { /* ignore */ }
@@ -324,7 +366,7 @@
   // ─── Pagination: the talent list uses page buttons, not infinite scroll ──
   function getCardDoc() {
     for (const doc of getAllDocs()) {
-      if (doc.querySelector('li.geek-info-card')) return doc;
+      if (doc.querySelector(CARD_SEL)) return doc;
     }
     return null;
   }
@@ -373,8 +415,10 @@
     const doc = getCardDoc();
     if (!doc) return false;
     const firstId = () => {
-      const first = doc.querySelector('li.geek-info-card a[data-contact]');
-      return first ? first.getAttribute('data-expect') : doc.querySelectorAll('li.geek-info-card').length;
+      const firstCard = doc.querySelector(CARD_SEL);
+      const idEl = firstCard ? getGeekIdEl(firstCard) : null;
+      if (idEl) return idEl.getAttribute('data-expect') || idEl.getAttribute('data-geek') || idEl.getAttribute('data-geekid');
+      return doc.querySelectorAll(CARD_SEL).length;
     };
     const start = Date.now();
     while (Date.now() - start < maxMs) {
@@ -408,7 +452,7 @@
     const doc = getCardDoc();
     if (!doc) return 0;
     const win = doc.defaultView || window;
-    const count = () => doc.querySelectorAll('li.geek-info-card').length;
+    const count = () => doc.querySelectorAll(CARD_SEL).length;
     let prev = count(), stagnant = 0;
 
     for (let i = 0; i < maxRounds; i++) {
@@ -416,7 +460,7 @@
         setStatus('检测到风控弹窗，停止加载', true);
         break;
       }
-      const cards = doc.querySelectorAll('li.geek-info-card');
+      const cards = doc.querySelectorAll(CARD_SEL);
       if (cards.length >= targetCards) break;
 
       const last = cards[cards.length - 1];
@@ -518,6 +562,17 @@
         return true;
       }
     }
+    return false;
+  }
+
+  // ─── Open a card's chat/profile WITHOUT sending (半自动 fill path) ─────
+  // Old DOM: click the `a[data-contact]` card link. New DOM (li.card-item)
+  // has no such link — best-effort click the name/avatar to open the panel.
+  function openCardChat(cardEl) {
+    const link = cardEl.querySelector('a[data-contact]');
+    if (link) { link.click(); return true; }
+    const target = cardEl.querySelector('.name-wrap .name, .name, .avatar-wrap, .avatar');
+    if (target) { target.click(); return true; }
     return false;
   }
 
@@ -817,8 +872,7 @@
       return;
     }
     // Open chat for this candidate by clicking their card link
-    const link = item.cardEl?.querySelector('a[data-contact]');
-    if (link) link.click();
+    if (item.cardEl) openCardChat(item.cardEl);
 
     setStatus(`正在为 ${item.name} 生成个性化话术...`);
     const draft = await fetchDraft(item);
@@ -893,8 +947,7 @@
       const clicked = clickGreetBtn(item.cardEl);
       if (!clicked) {
         // Fallback: open chat then fill + try to find send button
-        const link = item.cardEl?.querySelector('a[data-contact]');
-        if (link) link.click();
+        if (item.cardEl) openCardChat(item.cardEl);
         await sleep(1500);
         fillChatInput(personalizedDraft || `您好，我们有合适的岗位机会想和您聊聊`);
         await sleep(500);
