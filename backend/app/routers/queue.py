@@ -33,12 +33,22 @@ class QueueItem(BaseModel):
     outreach_id: int | None = None
     llm_score: float | None = None
     llm_reason: str = ""
+    # 候选人原始信息(用于列表内联展示,对齐 BOSS"推荐牛人"卡片信息量)
+    boss_id: str = ""  # 候选人在 BOSS 页面上的卡片标识(data-geek),用于"跳转到 BOSS"功能
+    age: int | None = None
+    education: str = ""
+    work_years: str = ""
+    salary_range: str = ""
+    job_status: str = ""
+    expected_city: str = ""
+    skills: str = ""
 
 
 @router.get("/queue/today")
 def get_today_queue(
     job_id: Optional[str] = Query(None),
     status_filter: Optional[str] = Query(None),
+    limit: Optional[int] = Query(None, ge=1, le=500),
     db: Session = Depends(get_db),
 ):
     """
@@ -75,6 +85,14 @@ def get_today_queue(
         query.add_columns(
             Candidate.name,
             Candidate.active_status,
+            Candidate.boss_id,
+            Candidate.age,
+            Candidate.education,
+            Candidate.work_years,
+            Candidate.salary_range,
+            Candidate.job_status,
+            Candidate.expected_city,
+            Candidate.skills,
             Job.title.label("job_title"),
             OutreachRecord.id.label("outreach_id"),
         )
@@ -90,7 +108,8 @@ def get_today_queue(
     seen = {}
     items = []
     for row in results:
-        mr, name, active_status, job_title, outreach_id = row
+        (mr, name, active_status, boss_id, age, education, work_years,
+         salary_range, job_status, expected_city, skills, job_title, outreach_id) = row
         cid = mr.candidate_id
         if cid in seen:
             continue
@@ -112,6 +131,17 @@ def get_today_queue(
             outreach_id=outreach_id,
             llm_score=mr.llm_score,
             llm_reason=mr.llm_reason or "",
+            boss_id=boss_id or "",
+            age=age,
+            education=education or "",
+            work_years=work_years or "",
+            salary_range=salary_range or "",
+            job_status=job_status or "",
+            expected_city=expected_city or "",
+            skills=skills or "",
         ))
+
+    if limit is not None:
+        items = items[:limit]
 
     return items

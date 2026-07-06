@@ -22,6 +22,14 @@ export interface QueueItem {
   outreach_id: number | null;
   llm_score: number | null;
   llm_reason: string;
+  boss_id: string;
+  age: number | null;
+  education: string;
+  work_years: string;
+  salary_range: string;
+  job_status: string;
+  expected_city: string;
+  skills: string;
 }
 
 export interface Job {
@@ -145,5 +153,9 @@ export const llmRerank = (jobId?: string, limit = 60) =>
 // 清理数据库（候选人/匹配/触达/页面快照，岗位配置保留）
 export const resetDb = () =>
   api.delete<{ deleted: Record<string, number> }>('/config/reset-db').then(r => r.data);
+
+// 跳转到 BOSS：请求油猴脚本在候选人卡片仍在屏幕上时自动点开并切前台（尽力而为）
+export const openCandidateInBoss = (bossId: string, name: string) =>
+  api.post<{ ok: boolean; error?: string }>('/ext/open-candidate', { boss_id: bossId, name }).then(r => r.data);
 
 export default api;

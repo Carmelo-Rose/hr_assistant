@@ -40,7 +40,16 @@ def upsert_candidate(
     ).first()
 
     if existing:
-        # Update mutable fields only
+        # Update mutable fields only. Refresh every presentation field on each
+        # rescan (not just salary/city/etc) so a candidate captured under a
+        # stale card-extraction bug self-heals once the userscript is fixed,
+        # instead of keeping bad data forever because only a subset refreshed.
+        if candidate_dict.get("name"):
+            existing.name = candidate_dict["name"]
+        existing.active_status = candidate_dict.get("activeStatus", existing.active_status)
+        existing.education = candidate_dict.get("education", existing.education)
+        existing.work_years = candidate_dict.get("experience", existing.work_years)
+        existing.skills = ", ".join(candidate_dict.get("skills", [])) or existing.skills
         existing.salary_range = candidate_dict.get("salary", existing.salary_range)
         existing.job_status = candidate_dict.get("jobStatus", existing.job_status)
         existing.expected_city = candidate_dict.get("expectCity", existing.expected_city)
@@ -62,6 +71,7 @@ def upsert_candidate(
             expect_id=expect_id,
             name=candidate_dict.get("name", "") or "未知",
             age=_parse_age(candidate_dict.get("age")),
+            active_status=candidate_dict.get("activeStatus", ""),
             education=candidate_dict.get("education", ""),
             school=candidate_dict.get("school", ""),
             work_years=candidate_dict.get("experience", ""),

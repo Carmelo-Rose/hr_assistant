@@ -1,6 +1,5 @@
 import { useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { useOutletContext } from 'react-router-dom';
 import {
   getQueue,
   listJobs,
@@ -9,14 +8,10 @@ import {
   bulkUpdateStatus,
   llmRerank,
   resetDb,
+  openCandidateInBoss,
   type QueueItem,
   type Job,
 } from '../api';
-
-interface OutletCtx {
-  selectedCandidate: QueueItem | null;
-  setSelectedCandidate: (item: QueueItem | null) => void;
-}
 
 function ScoreBadge({ score }: { score: number }) {
   const color =
@@ -82,6 +77,51 @@ function ConfirmDialog({ message, onConfirm, onCancel }: { message: string; onCo
   );
 }
 
+function CheckBadges({ item }: { item: QueueItem }) {
+  const checks = [
+    { label: '年龄', pass: item.age_pass },
+    { label: '经验', pass: item.experience_match },
+    { label: '能力', pass: item.capability_match },
+  ];
+  return (
+    <div className="flex gap-1.5 mt-1">
+      {checks.map(c => (
+        <span key={c.label} className={`px-1.5 py-0.5 rounded text-[11px] font-medium ${
+          c.pass ? 'bg-green-50 text-green-700' : 'bg-red-50 text-red-600'
+        }`}>
+          {c.label} {c.pass ? '✓' : '✗'}
+        </span>
+      ))}
+    </div>
+  );
+}
+
+function InfoLine({ item }: { item: QueueItem }) {
+  const parts = [
+    item.age != null ? `${item.age}岁` : '',
+    item.work_years,
+    item.education,
+    item.salary_range,
+    item.expected_city,
+    item.job_status,
+  ].filter(Boolean);
+  if (!parts.length) return null;
+  return <div className="text-xs text-gray-500 mt-1">{parts.join(' · ')}</div>;
+}
+
+function SkillTags({ skills }: { skills: string }) {
+  if (!skills) return null;
+  const tags = skills.split(',').map(s => s.trim()).filter(Boolean).slice(0, 6);
+  if (!tags.length) return null;
+  return (
+    <div className="flex flex-wrap gap-1 mt-1.5">
+      {tags.map(t => (
+        <span key={t} className="px-1.5 py-0.5 rounded bg-gray-100 text-gray-500 text-[11px]">{t}</span>
+      ))}
+    </div>
+  );
+}
+
 function MissingWarning({ info }: { info: string }) {
   if (!info) return null;
   return (
@@ -96,7 +136,6 @@ function MissingWarning({ info }: { info: string }) {
 
 export default function Dashboard() {
   const queryClient = useQueryClient();
-  const { setSelectedCandidate } = useOutletContext<OutletCtx>();
   const [jobFilter, setJobFilter] = useState('');
   const [view, setView] = useState<'active' | 'skipped'>('active');
   const [actionLoading, setActionLoading] = useState<string | null>(null);
@@ -162,6 +201,21 @@ export default function Dashboard() {
       queryClient.invalidateQueries({ queryKey: ['queue'] });
     },
     onError: (e: any) => setRerankMsg('AI 精评失败：' + (e?.message || '请求出错')),
+  });
+
+  const [bossJumpMsg, setBossJumpMsg] = useState<string | null>(null);
+  const bossJumpMutation = useMutation({
+    mutationFn: ({ bossId, name }: { bossId: string; name: string }) => openCandidateInBoss(bossId, name),
+    onSuccess: (res, { name }) => {
+      setBossJumpMsg(res.ok
+        ? `已请求跳转到 ${name}，若 BOSS 标签页里该候选人卡片仍在屏幕上会自动切前台`
+        : (res.error || '请求失败'));
+      setTimeout(() => setBossJumpMsg(null), 4000);
+    },
+    onError: () => {
+      setBossJumpMsg('跳转请求失败，请确认后端已启动');
+      setTimeout(() => setBossJumpMsg(null), 4000);
+    },
   });
 
   const handleAction = async (action: string, fn: () => Promise<any>) => {
@@ -264,6 +318,9 @@ export default function Dashboard() {
         {resetMsg && (
           <div className="px-4 py-2 text-xs text-red-700 bg-red-50 border-b border-red-100">{resetMsg}</div>
         )}
+        {bossJumpMsg && (
+          <div className="px-4 py-2 text-xs text-blue-700 bg-blue-50 border-b border-blue-100">{bossJumpMsg}</div>
+        )}
 
         {queueLoading ? (
           <div className="p-8 text-center text-gray-400">加载中...</div>
@@ -287,8 +344,12 @@ export default function Dashboard() {
             {queue.map((item: QueueItem) => (
               <div
                 key={item.match_id}
-                onClick={() => setSelectedCandidate(item)}
-                className="p-4 hover:bg-gray-50 transition-colors cursor-pointer"
+                onClick={() => {
+                  if (!item.boss_id) return;
+                  bossJumpMutation.mutate({ bossId: item.boss_id, name: item.name });
+                }}
+                className={`p-4 hover:bg-gray-50 transition-colors ${item.boss_id ? 'cursor-pointer' : ''}`}
+                title={item.boss_id ? '点击跳转到 BOSS（若该卡片仍在 BOSS 标签页上）' : undefined}
               >
                 <div className="flex items-start justify-between">
                   <div className="flex-1 min-w-0">
@@ -303,6 +364,8 @@ export default function Dashboard() {
                         <span className="text-xs text-gray-400">{item.active_status}</span>
                       )}
                     </div>
+                    <InfoLine item={item} />
+                    <CheckBadges item={item} />
                     <div className="text-xs text-gray-500 mt-1">
                       匹配岗位: <span className="font-medium">{item.job_title}</span>
                     </div>
@@ -313,6 +376,7 @@ export default function Dashboard() {
                       <div className="text-xs text-gray-500 mt-0.5 line-clamp-1">{item.match_reason}</div>
                     )}
                     <MissingWarning info={item.missing_info} />
+                    <SkillTags skills={item.skills} />
                     {drafts[item.match_id] && (
                       <div
                         className="mt-2 bg-purple-50 border border-purple-100 rounded-lg p-2.5 text-xs text-gray-700 whitespace-pre-wrap"
@@ -351,8 +415,9 @@ export default function Dashboard() {
                         </button>
                         <button
                           onClick={() => handleAction(`sent-${item.match_id}`, () => statusMutation.mutateAsync({ matchId: item.match_id, status: 'sent_manual' }))}
-                          disabled={actionLoading !== null || !['drafted', 'filled'].includes(item.status)}
+                          disabled={actionLoading !== null}
                           className="px-2.5 py-1 text-xs bg-green-50 text-green-700 rounded-md hover:bg-green-100 disabled:opacity-40"
+                          title="已在 BOSS 上打过招呼？点这个标记，不要求先在这里生成话术"
                         >
                           标记已发送
                         </button>
