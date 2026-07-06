@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BOSS 招聘助手 — 油猴版
 // @namespace    https://github.com/hr_assistant
-// @version      1.16.0
+// @version      1.20.0
 // @description  在 BOSS 直聘页面内扫描候选人、评分、辅助/自动打招呼
 // @match        https://www.zhipin.com/*
 // @noframes
@@ -27,6 +27,9 @@
 
   // ─── Configuration ────────────────────────────────────────────────
   const BACKEND = 'http://localhost:8000/api/ext';
+  // Root API (without /ext prefix) — used by the in-panel queue view for
+  // /queue/today, /outreach/*. Old BACKEND stays for the scan/greet flow.
+  const BACKEND_ROOT = 'http://localhost:8000/api';
   // `li.card-item` = 新版推荐/沟通页卡片（2026-07 起）；`li.geek-info-card` = 旧版人才库搜索页卡片。
   // 两个选择器并存，哪个页面用哪套 DOM 就匹配哪个。
   const CARD_SEL = 'li.card-item, li.geek-info-card';
@@ -39,7 +42,7 @@
     jobs: [],          // [{id, title}]
     llmEnabled: false, // backend has LLM configured → personalize greetings
     threshold: 70,
-    dailyCap: 50,
+    dailyCap: 150,
     delayMin: 5,
     delayMax: 15,
     greetingCount: 0,
@@ -91,6 +94,44 @@
     });
   }
 
+  // ─── Root-level API (no /ext prefix) — used by the queue panel ────
+  // Kept as a separate set so the scan/greet flow (BACKEND with /ext) is
+  // untouched. All three share the same GM_xmlhttpRequest error surface.
+  function _rootRequest(method, path, body, opts) {
+    const timeoutMs = (opts && opts.timeoutMs) || 30000;
+    return new Promise((resolve, reject) => {
+      const req = {
+        method,
+        url: BACKEND_ROOT + path,
+        onload: (res) => {
+          if (res.status >= 400) {
+            let msg = `HTTP ${res.status}`;
+            try {
+              const j = JSON.parse(res.responseText);
+              if (j && j.detail) msg = typeof j.detail === 'string' ? j.detail : JSON.stringify(j.detail);
+            } catch {}
+            reject(new Error(msg));
+            return;
+          }
+          if (!res.responseText) { resolve(null); return; }
+          try { resolve(JSON.parse(res.responseText)); }
+          catch { reject(new Error('Parse error: ' + res.responseText.slice(0, 200))); }
+        },
+        onerror: () => reject(new Error('Network error')),
+        ontimeout: () => reject(new Error('Timeout')),
+        timeout: timeoutMs,
+      };
+      if (body !== undefined && body !== null) {
+        req.headers = { 'Content-Type': 'application/json' };
+        req.data = JSON.stringify(body);
+      }
+      GM_xmlhttpRequest(req);
+    });
+  }
+  function apiGetRoot(path, opts) { return _rootRequest('GET', path, null, opts); }
+  function apiPostRoot(path, body, opts) { return _rootRequest('POST', path, body || {}, opts); }
+  function apiPatchRoot(path, body, opts) { return _rootRequest('PATCH', path, body || {}, opts); }
+
   function randDelay() {
     return Math.floor(Math.random() * (state.delayMax - state.delayMin + 1) + state.delayMin) * 1000;
   }
@@ -100,12 +141,21 @@
     GM_setValue('boss_count', state.greetingCount);
   }
 
-  // ─── Helpers: collect all accessible documents (main + same-origin iframes) ──
+  // ─── Helpers: collect all accessible documents (main + same-origin iframes,
+  // recursively — e.g. the candidate list iframe itself hosts a nested
+  // c-resume iframe for the profile/chat panel opened on card click) ──
   function getAllDocs() {
-    const docs = [document];
-    document.querySelectorAll('iframe').forEach(f => {
-      try { if (f.contentDocument) docs.push(f.contentDocument); } catch {}
-    });
+    const docs = [];
+    const seen = new Set();
+    function visit(doc, depth) {
+      if (!doc || seen.has(doc) || depth > 3) return;
+      seen.add(doc);
+      docs.push(doc);
+      doc.querySelectorAll('iframe').forEach(f => {
+        try { if (f.contentDocument) visit(f.contentDocument, depth + 1); } catch {}
+      });
+    }
+    visit(document, 0);
     return docs;
   }
 
@@ -126,6 +176,32 @@
     return card.querySelector('a[data-contact]') || card.querySelector('[data-geek],[data-geekid]');
   }
 
+  // Structured extraction for the new li.card-item DOM: fields sit in dedicated
+  // classes with no reliable whitespace between them (the old heuristic below
+  // requires 2+ space chars to split a line, which this markup doesn't have —
+  // that's why name/age/salary came out wrong after the 2026-07 BOSS redesign).
+  function _structuredFields(card) {
+    const name = card.querySelector('.name-wrap .name')?.textContent?.trim() || '';
+    const activeStatus = card.querySelector('.name-wrap .active-text')?.textContent?.trim() || '';
+    const salary = card.querySelector('.salary-wrap span, .salary-wrap')?.textContent?.trim() || '';
+
+    let age = '', experience = '', education = '', jobStatus = '';
+    card.querySelectorAll('.base-info span').forEach(el => {
+      const t = (el.textContent || '').trim();
+      if (!t) return;
+      if (t.includes('岁')) age = t;
+      else if (t.includes('年')) experience = t;
+      else if (['本科', '硕士', '博士', '大专', '高中', '中专'].some(e => t.includes(e))) education = t;
+      else if (t.includes('离职') || t.includes('在职') || t.includes('到岗')) jobStatus = t;
+    });
+
+    let expectCity = '';
+    const expectSpans = card.querySelectorAll('.expect-wrap .content span');
+    if (expectSpans[0]) expectCity = expectSpans[0].textContent.trim();
+
+    return { name, age, experience, education, jobStatus, salary, activeStatus, expectCity };
+  }
+
   function _extractFromCards(cards) {
     const results = [];
 
@@ -135,32 +211,40 @@
       const idEl = getGeekIdEl(card);
       const lines = text.split('\n').map(l => l.trim()).filter(l => l);
 
-      const name = lines[0] || '未知';
-      let age = '', experience = '', education = '', jobStatus = '', salary = '';
-      for (const line of lines) {
-        const parts = line.split(/\s{2,}/);
-        if (parts.length >= 3) {
-          for (const part of parts) {
-            if (part.includes('岁')) age = part;
-            else if (part.includes('年')) experience = part;
-            else if (['本科', '硕士', '博士', '大专', '高中'].some(e => part.includes(e))) education = part;
-            else if (part.includes('离职') || part.includes('在职') || part.includes('到岗')) jobStatus = part;
-            else if (part.includes('K') || part.includes('k') || part.includes('面议') || part.includes('薪')) salary = part;
+      const structured = _structuredFields(card);
+      let name, age, experience, education, jobStatus, salary, expectCity;
+      if (structured.age || structured.experience || structured.education || structured.jobStatus) {
+        // New DOM matched — trust the structured values wholesale.
+        ({ age, experience, education, jobStatus, salary, expectCity } = structured);
+        name = structured.name || lines[0] || '未知';
+      } else {
+        // Old DOM (li.geek-info-card) fallback: guess fields from line text.
+        name = lines[0] || '未知';
+        age = ''; experience = ''; education = ''; jobStatus = ''; salary = ''; expectCity = '';
+        for (const line of lines) {
+          const parts = line.split(/\s{2,}/);
+          if (parts.length >= 3) {
+            for (const part of parts) {
+              if (part.includes('岁')) age = part;
+              else if (part.includes('年')) experience = part;
+              else if (['本科', '硕士', '博士', '大专', '高中'].some(e => part.includes(e))) education = part;
+              else if (part.includes('离职') || part.includes('在职') || part.includes('到岗')) jobStatus = part;
+              else if (part.includes('K') || part.includes('k') || part.includes('面议') || part.includes('薪')) salary = part;
+            }
+            if (age || experience) break;
           }
-          if (age || experience) break;
+        }
+        const cityIdx = lines.findIndex(l => l === '期望城市');
+        if (cityIdx >= 0 && lines[cityIdx + 1]) expectCity = lines[cityIdx + 1];
+        if (!expectCity) {
+          const expIdx = lines.findIndex(l => l === '期望');
+          if (expIdx >= 0 && lines[expIdx + 1]) expectCity = lines[expIdx + 1];
         }
       }
+      const activeStatus = structured.activeStatus || '';
 
       const skillEls = card.querySelectorAll('.rcd-tags span, .tag-item, [class*="tag"]');
       const skills = Array.from(skillEls).map(el => el.innerText.trim()).filter(s => s.length > 0 && s.length < 20);
-
-      let expectCity = '';
-      const cityIdx = lines.findIndex(l => l === '期望城市');
-      if (cityIdx >= 0 && lines[cityIdx + 1]) expectCity = lines[cityIdx + 1];
-      if (!expectCity) {
-        const expIdx = lines.findIndex(l => l === '期望');
-        if (expIdx >= 0 && lines[expIdx + 1]) expectCity = lines[expIdx + 1];
-      }
 
       let company = '', title = '';
       const posIdx = lines.findIndex(l => l === '职位');
@@ -183,7 +267,7 @@
       const jid = idEl ? (idEl.getAttribute('data-jid') || '') : '';
 
       results.push({
-        index: idx, name, age, experience, education, jobStatus, salary,
+        index: idx, name, age, experience, education, jobStatus, salary, activeStatus,
         skills: skills.slice(0, 8),
         expectCity, company, title, school, major,
         expectId, lid, jid,
@@ -371,6 +455,99 @@
     return null;
   }
 
+  // Diagnostic dump for "找不到聊天输入框/发送按钮" failures — captures every
+  // visible textarea/input/contenteditable element plus any open dialog/
+  // panel-like container across all accessible documents, and copies it to
+  // the clipboard so the actual selector mismatch can be identified without
+  // opening DevTools (which BOSS's anti-debug bounces to about:blank).
+  function dumpChatInputDiag() {
+    const ourPanels = [document.getElementById('boss-helper-panel'), document.getElementById('boss-helper-queue-panel')];
+    const inputs = [];
+    const panels = [];
+    const iframes = [];
+    const greetBtns = [];
+    const greetRe = /^(打招呼|立即沟通|继续沟通|去沟通|沟通|联系Ta|联系TA|发送|发 送)$/;
+    getAllDocs().forEach((doc, di) => {
+      // All inputs — hidden ones too (an inline greeting box is often hidden
+      // until you click 打招呼, so filtering hidden would erase the clue).
+      doc.querySelectorAll('textarea, [contenteditable="true"], input[type="text"], input:not([type])').forEach(el => {
+        if (ourPanels.some(p => p && p.contains(el))) return;
+        inputs.push({
+          doc: di,
+          tag: el.tagName.toLowerCase(),
+          visible: el.offsetParent !== null,
+          class: el.getAttribute('class') || '',
+          placeholder: el.getAttribute('placeholder') || '',
+          parentClass: el.parentElement ? (el.parentElement.getAttribute('class') || '') : '',
+        });
+      });
+      doc.querySelectorAll('[class*="dialog"],[class*="modal"],[class*="popup"],[class*="drawer"],[class*="chat"],[class*="im-"],[class*="resume"]').forEach(el => {
+        if (ourPanels.some(p => p && p.contains(el))) return;
+        if (el.offsetParent === null) return;
+        panels.push(`doc${di} | ${el.tagName.toLowerCase()} | class="${el.getAttribute('class') || ''}"`);
+      });
+      // Greet / send buttons by visible text — tells us what to click to
+      // reveal the input (or to send) on this particular BOSS page layout.
+      doc.querySelectorAll('button,a,span,div').forEach(el => {
+        if (ourPanels.some(p => p && p.contains(el))) return;
+        if (el.children.length !== 0) return;
+        if (!greetRe.test((el.textContent || '').trim())) return;
+        if (el.offsetParent === null) return;
+        greetBtns.push(`doc${di} | ${el.tagName.toLowerCase()} | text="${el.textContent.trim()}" | class="${el.getAttribute('class') || ''}" | parentClass="${el.parentElement ? (el.parentElement.getAttribute('class') || '') : ''}"`);
+      });
+      // Every iframe in this doc, with src + whether contentDocument is
+      // reachable — pinpoints cross-origin (Same-Origin Policy blocks us
+      // structurally, no selector fix possible) vs. same-origin-but-missed.
+      doc.querySelectorAll('iframe').forEach(f => {
+        let accessible = false, reason = '';
+        try {
+          accessible = !!f.contentDocument;
+          if (accessible) reason = `readyState=${f.contentDocument.readyState}, bodyChildren=${f.contentDocument.body ? f.contentDocument.body.children.length : 'n/a'}`;
+        } catch (err) {
+          reason = 'blocked: ' + err.message;
+        }
+        iframes.push({
+          inDoc: di,
+          class: f.getAttribute('class') || '',
+          src: f.getAttribute('src') || '(no src attr)',
+          accessible,
+          reason,
+        });
+      });
+    });
+    // Stamp the ACTUALLY-loaded script version so there's no ambiguity about
+    // whether Tampermonkey picked up the latest edit.
+    let scriptVersion = '?';
+    try { scriptVersion = (GM_info && GM_info.script && GM_info.script.version) || '?'; } catch {}
+    const report = { scriptVersion, url: location.href, docCount: getAllDocs().length, inputs, greetBtns: greetBtns.slice(0, 20), panels: panels.slice(0, 20), iframes };
+    const text = 'BOSS-INPUT-DIAG\n' + JSON.stringify(report, null, 2);
+    try { GM_setClipboard(text); } catch {}
+    return text;
+  }
+
+  // Resolve a queue item's boss_id to a live card element on the current page.
+  // Tier 1: state.scanned cache (fast; re-check .isConnected since SPA
+  // re-renders can detach nodes between calls). Tier 2: full DOM scan —
+  // queue items may come from a prior scan session / a different page than
+  // what's currently rendered. Returns null if not found on this page now.
+  function findCardByBossId(bossId) {
+    if (!bossId) return null;
+    for (const it of state.scanned || []) {
+      if (it && it.expectId === bossId && it.cardEl && it.cardEl.isConnected) {
+        return it.cardEl;
+      }
+    }
+    for (const doc of getAllDocs()) {
+      for (const card of doc.querySelectorAll(CARD_SEL)) {
+        const idEl = getGeekIdEl(card);
+        if (!idEl) continue;
+        const id = idEl.getAttribute('data-expect') || idEl.getAttribute('data-geek') || idEl.getAttribute('data-geekid');
+        if (id === bossId) return card;
+      }
+    }
+    return null;
+  }
+
   // Click the "下一页" pagination control. Returns false if missing/disabled
   // (i.e. we're on the last page). Clicking is normal navigation → low risk.
   function isDisabledEl(el) {
@@ -501,39 +678,117 @@
     return count();
   }
 
-  // ─── Fill chat input ──────────────────────────────────────────────
-  function fillChatInput(text) {
-    const selectors = [
-      'textarea[class*="chat-input"]',
-      'textarea[class*="message-input"]',
-      'div[class*="chat"] textarea',
-      'textarea[placeholder*="说"]',
-      'textarea[placeholder*="输入"]',
-      '[contenteditable="true"][class*="chat"]',
-      '[contenteditable="true"][class*="message"]',
-      '[class*="chat-input"] [contenteditable="true"]',
-    ];
+  // ─── Chat input discovery / fill ──────────────────────────────────
+  const CHAT_INPUT_SELECTORS = [
+    'textarea[class*="chat-input"]',
+    'textarea[class*="message-input"]',
+    'div[class*="chat"] textarea',
+    'textarea[placeholder*="说"]',
+    'textarea[placeholder*="输入"]',
+    'textarea[placeholder*="招呼"]',
+    '[contenteditable="true"][class*="chat"]',
+    '[contenteditable="true"][class*="message"]',
+    '[class*="chat-input"] [contenteditable="true"]',
+    '[class*="greet"] textarea',
+    '[class*="dialog"] textarea',
+    '[class*="popup"] textarea',
+    'textarea',  // last resort — filtered below to avoid the job-search input
+  ];
 
-    for (const sel of selectors) {
-      const el = document.querySelector(sel);
-      if (el) {
-        const tag = el.tagName.toLowerCase();
-        if (tag === 'textarea' || tag === 'input') {
-          // Use native input setter to trigger React reconciliation
-          const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
-            window.HTMLTextAreaElement.prototype, 'value'
-          ).set;
-          nativeInputValueSetter.call(el, text);
-          el.dispatchEvent(new Event('input', { bubbles: true }));
-          el.dispatchEvent(new Event('change', { bubbles: true }));
-        } else if (el.getAttribute('contenteditable') === 'true') {
-          el.textContent = text;
-          el.dispatchEvent(new Event('input', { bubbles: true }));
+  // Locate a *visible* chat/greeting input across all accessible docs (cards
+  // and the chat/greet panel live in nested same-origin iframes). Skips the
+  // 请输入职位名称 job-search box (an <input class="ipt chat-job-search">).
+  function findChatInputEl() {
+    for (const doc of getAllDocs()) {
+      for (const sel of CHAT_INPUT_SELECTORS) {
+        for (const el of doc.querySelectorAll(sel)) {
+          if (el.offsetParent === null) continue; // must be visible
+          const cls = el.getAttribute('class') || '';
+          const ph = el.getAttribute('placeholder') || '';
+          if (/search|职位/.test(cls) || /职位/.test(ph)) continue;
+          return el;
         }
-        return true;
+      }
+    }
+    return null;
+  }
+
+  // Poll for a chat input to appear (BOSS renders the greet compose box async
+  // after the 打招呼 button is clicked). Returns the element or null.
+  async function waitForChatInput(maxMs) {
+    const start = Date.now();
+    while (Date.now() - start < maxMs) {
+      const el = findChatInputEl();
+      if (el) return el;
+      await sleep(300);
+    }
+    return null;
+  }
+
+  function fillInputEl(el, text) {
+    const tag = el.tagName.toLowerCase();
+    const win = el.ownerDocument.defaultView || window;
+    if (tag === 'textarea' || tag === 'input') {
+      const proto = tag === 'textarea' ? win.HTMLTextAreaElement.prototype : win.HTMLInputElement.prototype;
+      const nativeInputValueSetter = Object.getOwnPropertyDescriptor(proto, 'value').set;
+      nativeInputValueSetter.call(el, text);
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+    } else if (el.getAttribute('contenteditable') === 'true') {
+      el.textContent = text;
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+  }
+
+  function fillChatInput(text) {
+    const el = findChatInputEl();
+    if (!el) return false;
+    fillInputEl(el, text);
+    return true;
+  }
+
+  // Find a visible send button across all docs — class-based first, then an
+  // exact 发送 text leaf (the greeting dialog's confirm button).
+  function findSendButton() {
+    for (const doc of getAllDocs()) {
+      const byClass = doc.querySelector('button[class*="send"]:not([disabled]), [class*="btn-send"]');
+      if (byClass && byClass.offsetParent !== null) return byClass;
+      for (const el of doc.querySelectorAll('button,a,span,div')) {
+        if (el.children.length !== 0) continue;
+        if (el.offsetParent === null) continue;
+        if (/^(发\s*送)$/.test((el.textContent || '').trim())) return el;
+      }
+    }
+    return null;
+  }
+
+  // Click a "打招呼" button anywhere (used after openCardChat opens the resume
+  // panel, whose greet button lives in the c-resume iframe). Tight regex
+  // (^打招呼$) so it never matches the sidebar 沟通 menu item.
+  function clickGreetButtonAnywhere() {
+    const ourPanels = [document.getElementById('boss-helper-panel'), document.getElementById('boss-helper-queue-panel')];
+    for (const doc of getAllDocs()) {
+      for (const sel of ['button.btn-getcontact', 'button[class*="getcontact"]', 'a.btn-greet', 'a[class*="greet"]', 'button[class*="greet"]']) {
+        const btn = doc.querySelector(sel);
+        if (btn && btn.offsetParent !== null && !ourPanels.some(p => p && p.contains(btn))) { btn.click(); return true; }
+      }
+      for (const el of doc.querySelectorAll('button,a,span,div')) {
+        if (el.children.length !== 0 || el.offsetParent === null) continue;
+        if (ourPanels.some(p => p && p.contains(el))) continue;
+        if (/^打招呼$/.test((el.textContent || '').trim())) { el.click(); return true; }
       }
     }
     return false;
+  }
+
+  // Trigger BOSS's greet flow for a card: prefer the card's own greet button;
+  // if the card has none (hover-only / new layout), open the resume panel and
+  // click its greet button. Returns true if a greet action was triggered.
+  async function triggerGreetUI(cardEl) {
+    if (clickGreetBtn(cardEl)) return true;
+    openCardChat(cardEl);
+    await sleep(1500);
+    return clickGreetButtonAnywhere();
   }
 
   // ─── Click "打招呼" button on a card ──────────────────────────────
@@ -567,11 +822,15 @@
 
   // ─── Open a card's chat/profile WITHOUT sending (半自动 fill path) ─────
   // Old DOM: click the `a[data-contact]` card link. New DOM (li.card-item)
-  // has no such link — best-effort click the name/avatar to open the panel.
+  // has no such link — best-effort click the candidate's name to open the
+  // detail popup. NOT the avatar: clicking it opens a video/photo preview
+  // lightbox instead (confirmed — a `.name-wrap .name, .avatar` combined
+  // selector matched the avatar first since it sits earlier in the DOM than
+  // the name, and querySelector doesn't prioritize by selector-list order).
   function openCardChat(cardEl) {
     const link = cardEl.querySelector('a[data-contact]');
     if (link) { link.click(); return true; }
-    const target = cardEl.querySelector('.name-wrap .name, .name, .avatar-wrap, .avatar');
+    const target = cardEl.querySelector('.name-wrap .name') || cardEl.querySelector('.name');
     if (target) { target.click(); return true; }
     return false;
   }
@@ -590,9 +849,13 @@
       padding: 10px 14px; background: #4f6ef7; color: #fff;
       border-radius: 12px 12px 0 0; cursor: move;
     }
-    .bh-header h3 { margin: 0; font-size: 14px; font-weight: 600; }
+    .bh-header h3 { margin: 0; font-size: 14px; font-weight: 600; cursor: pointer; display: flex; align-items: center; gap: 6px; }
+    .bh-collapse-arrow { display: inline-block; transition: transform 0.15s; font-size: 10px; }
     .bh-header .bh-close { cursor: pointer; font-size: 18px; line-height: 1; }
     .bh-body { padding: 12px 14px; }
+    #boss-helper-panel.bh-collapsed .bh-body { display: none; }
+    #boss-helper-panel.bh-collapsed .bh-collapse-arrow { transform: rotate(-90deg); }
+    #boss-helper-panel.bh-collapsed .bh-header { border-radius: 12px; }
     .bh-row { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
     .bh-row label { min-width: 70px; font-size: 12px; color: #666; }
     .bh-row input[type=number] { width: 60px; padding: 4px 6px; border: 1px solid #ddd; border-radius: 6px; }
@@ -624,6 +887,135 @@
     .bh-card-score.low { background: #f8d7da; color: #721c24; }
     .bh-card-score.blocked { background: #343a40; color: #fff; }
     .bh-card-score.contacted { background: #e2e3e5; color: #6c757d; }
+
+    /* ─── Queue panel ─────────────────────────────────────────────── */
+    #boss-helper-queue-panel {
+      position: fixed; top: 80px; right: 372px; z-index: 99998;
+      width: 780px; max-height: 82vh;
+      display: none; flex-direction: column;
+      background: #fff; border-radius: 12px;
+      box-shadow: 0 6px 32px rgba(0,0,0,.20);
+      font-family: -apple-system, sans-serif; font-size: 13px; color: #333;
+    }
+    #boss-helper-queue-panel.bhq-stacked {
+      right: 20px; width: 340px;
+    }
+    .bhq-header {
+      display: flex; align-items: center; gap: 8px;
+      padding: 10px 14px; background: #4f6ef7; color: #fff;
+      border-radius: 12px 12px 0 0; cursor: move; user-select: none;
+    }
+    .bhq-header h3 { margin: 0; font-size: 14px; font-weight: 600; flex: 0 0 auto; }
+    .bhq-tabs { display: flex; gap: 4px; margin-left: 10px; }
+    .bhq-tab {
+      padding: 3px 10px; border-radius: 12px; font-size: 12px;
+      cursor: pointer; background: rgba(255,255,255,0.15); color: #fff;
+    }
+    .bhq-tab.active { background: #fff; color: #4f6ef7; font-weight: 600; }
+    .bhq-header-spacer { flex: 1; }
+    .bhq-header-btn {
+      cursor: pointer; padding: 3px 8px; border-radius: 6px;
+      background: rgba(255,255,255,0.15); font-size: 12px;
+    }
+    .bhq-header-btn:hover { background: rgba(255,255,255,0.28); }
+    .bhq-close { cursor: pointer; font-size: 18px; line-height: 1; margin-left: 4px; }
+
+    .bhq-toolbar {
+      display: flex; align-items: center; gap: 8px;
+      padding: 8px 14px; border-bottom: 1px solid #eee;
+      background: #fafbfc;
+    }
+    .bhq-toolbar-status { flex: 1; font-size: 11px; color: #888; }
+    .bhq-toolbar-status.err { color: #e74c3c; }
+
+    .bhq-list {
+      flex: 1; overflow-y: auto; padding: 6px 8px 12px;
+      min-height: 120px;
+    }
+    .bhq-empty { padding: 40px 20px; text-align: center; color: #aaa; font-size: 12px; }
+    .bhq-row {
+      display: flex; gap: 10px; align-items: flex-start;
+      padding: 10px 10px; border-bottom: 1px solid #f0f0f0;
+      cursor: pointer; transition: background 0.12s;
+    }
+    .bhq-row:hover { background: #f7f9ff; }
+    .bhq-row-main { flex: 1; min-width: 0; }
+    .bhq-row-actions { flex: 0 0 auto; display: flex; gap: 4px; align-items: center; }
+    .bhq-name-line { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+    .bhq-name { font-size: 13px; font-weight: 600; color: #222; }
+    .bhq-badge {
+      display: inline-block; padding: 1px 7px; border-radius: 10px;
+      font-size: 11px; font-weight: 600; line-height: 1.4;
+    }
+    .bhq-badge.score-high { background: #d4edda; color: #1e7e34; }
+    .bhq-badge.score-mid { background: #fff3cd; color: #856404; }
+    .bhq-badge.score-low { background: #f8d7da; color: #721c24; }
+    .bhq-badge.llm-high { background: #e3e0ff; color: #4b3fbb; }
+    .bhq-badge.llm-mid { background: #ede9fe; color: #6b46c1; }
+    .bhq-badge.llm-low { background: #ffe1ec; color: #b0345c; }
+    .bhq-status-dot {
+      display: inline-block; width: 7px; height: 7px; border-radius: 50%;
+      background: #bbb; flex-shrink: 0;
+    }
+    .bhq-status-dot.new { background: #6c757d; }
+    .bhq-status-dot.queued { background: #4f6ef7; }
+    .bhq-status-dot.drafted { background: #17a2b8; }
+    .bhq-status-dot.filled { background: #ffc107; }
+    .bhq-status-dot.sent_manual { background: #28a745; }
+    .bhq-status-dot.skipped { background: #dc3545; }
+    .bhq-active { font-size: 11px; color: #999; }
+    .bhq-info {
+      font-size: 11px; color: #666; margin-top: 3px;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .bhq-reason {
+      font-size: 11px; color: #555; margin-top: 3px;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .bhq-reason.ai { color: #4b3fbb; }
+    .bhq-missing {
+      font-size: 11px; color: #b26a00; margin-top: 3px;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .bhq-act {
+      padding: 3px 9px; border-radius: 6px; border: none;
+      font-size: 11px; cursor: pointer; font-weight: 500;
+    }
+    .bhq-act-primary { background: #4f6ef7; color: #fff; }
+    .bhq-act-success { background: #28a745; color: #fff; }
+    .bhq-act-danger { background: #e74c3c; color: #fff; }
+    .bhq-act-secondary { background: #eef0f4; color: #333; }
+    .bhq-act:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    .bhq-progress-wrap {
+      display: flex; align-items: center; gap: 10px;
+      padding: 8px 14px; border-bottom: 1px solid #eee;
+      background: #fafbfc;
+    }
+    .bhq-progress-bar {
+      flex: 1; height: 6px; border-radius: 3px; background: #e6e9f0; overflow: hidden;
+    }
+    .bhq-progress-fill {
+      height: 100%; width: 0%; background: #4f6ef7; border-radius: 3px;
+      transition: width 0.25s ease;
+    }
+    .bhq-progress-text { flex: 0 0 auto; font-size: 11px; color: #666; white-space: nowrap; }
+
+    .bhq-toast {
+      position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
+      z-index: 100001; padding: 8px 18px; border-radius: 6px;
+      background: rgba(0,0,0,0.82); color: #fff; font-size: 12px;
+      opacity: 0; transition: opacity 0.2s; pointer-events: none;
+    }
+    .bhq-toast.show { opacity: 1; }
+    .bhq-toast.err { background: rgba(200, 30, 30, 0.9); }
+
+    /* Locate-on-page highlight (applied to a BOSS card temporarily) */
+    .bhq-located {
+      outline: 3px solid #4f6ef7 !important;
+      outline-offset: 2px;
+      transition: outline 0.15s;
+    }
   `);
 
   function createPanel() {
@@ -635,7 +1027,7 @@
     panel.id = 'boss-helper-panel';
     panel.innerHTML = `
       <div class="bh-header">
-        <h3>BOSS 招聘助手</h3>
+        <h3><span class="bh-collapse-arrow">▾</span>BOSS 招聘助手</h3>
         <span class="bh-close">×</span>
       </div>
       <div class="bh-body">
@@ -652,16 +1044,6 @@
           <span id="bh-threshold-val">${state.threshold}</span>
         </div>
         <div class="bh-row">
-          <label>每日上限</label>
-          <input type="number" id="bh-cap-input" value="${state.dailyCap}" min="1" max="500">
-        </div>
-        <div class="bh-row">
-          <label>间隔(秒)</label>
-          <input type="number" id="bh-delay-min" value="${state.delayMin}" min="1" max="120" style="width:50px">
-          ~
-          <input type="number" id="bh-delay-max" value="${state.delayMax}" min="1" max="120" style="width:50px">
-        </div>
-        <div class="bh-row">
           <label>模式</label>
           <select id="bh-mode">
             <option value="semi">半自动</option>
@@ -675,10 +1057,11 @@
           <input type="number" id="bh-maxcand" value="${state.maxCandidates}" min="15" max="2000" step="15" style="width:56px">
           <span style="font-size:11px;color:#999">人</span>
         </div>
-        <div style="display:flex;gap:8px;margin-top:12px;">
+        <div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap;">
           <button class="bh-btn bh-btn-primary" id="bh-scan">扫描列表</button>
           <button class="bh-btn bh-btn-primary" id="bh-start" style="display:none">开始</button>
           <button class="bh-btn bh-btn-danger" id="bh-stop" style="display:none">停止</button>
+          <button class="bh-btn bh-btn-secondary" id="bh-open-queue">查看队列</button>
           <button class="bh-btn bh-btn-secondary" id="bh-diag">诊断</button>
         </div>
         <div class="bh-status" id="bh-status">就绪</div>
@@ -688,20 +1071,30 @@
 
     // Drag
     const header = panel.querySelector('.bh-header');
-    let dragging = false, dx = 0, dy = 0;
+    let dragging = false, dx = 0, dy = 0, didDrag = false;
     header.addEventListener('mousedown', (e) => {
       dragging = true;
+      didDrag = false;
       dx = e.clientX - panel.getBoundingClientRect().left;
       dy = e.clientY - panel.getBoundingClientRect().top;
       panel.classList.add('dragging');
     });
     document.addEventListener('mousemove', (e) => {
       if (!dragging) return;
+      didDrag = true;
       panel.style.left = (e.clientX - dx) + 'px';
       panel.style.top = (e.clientY - dy) + 'px';
       panel.style.right = 'auto';
     });
     document.addEventListener('mouseup', () => { dragging = false; panel.classList.remove('dragging'); });
+
+    // Click title to collapse/expand the body (keeps the header bar visible
+    // so the panel can be tucked away without losing scan state or having to
+    // reload the page, unlike the × which removes it entirely).
+    header.querySelector('h3').addEventListener('click', () => {
+      if (didDrag) { didDrag = false; return; }
+      panel.classList.toggle('bh-collapsed');
+    });
 
     // Close
     panel.querySelector('.bh-close').addEventListener('click', () => panel.remove());
@@ -716,18 +1109,6 @@
     thresholdEl.addEventListener('input', () => {
       state.threshold = parseInt(thresholdEl.value);
       thresholdValEl.textContent = state.threshold;
-    });
-
-    document.getElementById('bh-cap-input').addEventListener('change', (e) => {
-      state.dailyCap = parseInt(e.target.value) || 50;
-      document.getElementById('bh-cap').textContent = state.dailyCap;
-    });
-
-    document.getElementById('bh-delay-min').addEventListener('change', (e) => {
-      state.delayMin = parseInt(e.target.value) || 5;
-    });
-    document.getElementById('bh-delay-max').addEventListener('change', (e) => {
-      state.delayMax = parseInt(e.target.value) || 15;
     });
 
     document.getElementById('bh-mode').addEventListener('change', (e) => {
@@ -746,6 +1127,7 @@
     document.getElementById('bh-start').addEventListener('click', doAutoStart);
     document.getElementById('bh-stop').addEventListener('click', doAutoStop);
     document.getElementById('bh-diag').addEventListener('click', diagnose);
+    document.getElementById('bh-open-queue').addEventListener('click', openQueuePanel);
 
     updateAutoButtons();
     return panel;
@@ -897,6 +1279,10 @@
 
   async function doAutoStart() {
     if (state.mode !== 'auto') return;
+    if (state.queuePanel.bulkGreetRunning) {
+      setStatus('队列面板批量打招呼进行中，请先停止', true);
+      return;
+    }
     if (state.greetingCount >= state.dailyCap) {
       setStatus('已达每日上限', true);
       return;
@@ -1024,15 +1410,9 @@
       const tEl = document.getElementById('bh-threshold');
       const tvEl = document.getElementById('bh-threshold-val');
       const capEl = document.getElementById('bh-cap');
-      const capInput = document.getElementById('bh-cap-input');
-      const dMin = document.getElementById('bh-delay-min');
-      const dMax = document.getElementById('bh-delay-max');
       if (tEl) { tEl.value = state.threshold; }
       if (tvEl) { tvEl.textContent = state.threshold; }
       if (capEl) { capEl.textContent = state.dailyCap; }
-      if (capInput) { capInput.value = state.dailyCap; }
-      if (dMin) { dMin.value = state.delayMin; }
-      if (dMax) { dMax.value = state.delayMax; }
     } catch {
       setStatus('后端未连接，使用默认配置', true);
     }
@@ -1060,10 +1440,40 @@
     }
   }
 
+  // ─── "跳转到 BOSS" 轮询 ──────────────────────────────────────────────
+  // Dashboard (localhost) posts a pending-open request when a queue row is
+  // clicked; we poll our own backend (not zhipin.com — zero anti-bot surface)
+  // and, if the requested candidate's card is still on THIS page, open it and
+  // raise the tab. Best-effort: does nothing if the card isn't currently
+  // rendered (different page/job/scroll position, or tab long since closed).
+  async function pollPendingOpen() {
+    let res;
+    try {
+      res = await apiGet('/pending-open');
+    } catch { return; }
+    if (!res || !res.boss_id) return;
+
+    for (const doc of getAllDocs()) {
+      for (const card of doc.querySelectorAll(CARD_SEL)) {
+        const idEl = getGeekIdEl(card);
+        if (!idEl) continue;
+        const id = idEl.getAttribute('data-expect') || idEl.getAttribute('data-geek') || idEl.getAttribute('data-geekid');
+        if (id === res.boss_id) {
+          openCardChat(card);
+          window.focus();
+          setStatus(`已跳转到 ${res.name || '候选人'}`);
+          return;
+        }
+      }
+    }
+    setStatus(`未找到 ${res.name || '该候选人'} 的卡片(可能已翻页/不在本页)`, true);
+  }
+
   // ─── Init ─────────────────────────────────────────────────────────
   const panel = createPanel();
   loadConfig();
   loadJobs();
+  setInterval(pollPendingOpen, 2500);
 
   // Add click handlers for scored cards (semi-auto mode).
   // Cards live inside an iframe, so attach to every accessible document — a
@@ -1086,6 +1496,738 @@
       doc.addEventListener('click', badgeClickHandler);
       _badgeBoundDocs.add(doc);
     }
+  }
+
+  // ─── Queue panel (队列复盘悬浮层) ──────────────────────────────────
+  // Second floating panel: shows /api/queue/today rows, supports draft-copy,
+  // sent/skip/restore, bulk-skip/restore, AI rerank, and click-to-locate on
+  // the current BOSS page. Coexists with the small scan panel — the scan
+  // panel keeps its scan/greet flow untouched. Uses BACKEND_ROOT (no /ext).
+  state.queuePanel = {
+    open: false,
+    tab: 'queue',            // 'queue' | 'skipped'
+    items: [],               // last-known list (kept in DOM order via diff)
+    itemsById: new Map(),    // match_id → item (fast lookup for actions/optimistic revert)
+    loading: false,
+    autoRefreshTimer: null,
+    llmBusy: false,
+    bulkGreetRunning: false, // true while doBulkGreet loop is active
+    sendingId: null,         // match_id currently being sent (single-row or bulk)
+  };
+
+  function ensureQueuePanel() {
+    let el = document.getElementById('boss-helper-queue-panel');
+    if (el) return el;
+    el = document.createElement('div');
+    el.id = 'boss-helper-queue-panel';
+    el.innerHTML = `
+      <div class="bhq-header">
+        <h3>队列复盘</h3>
+        <div class="bhq-tabs">
+          <span class="bhq-tab active" data-tab="queue">队列</span>
+          <span class="bhq-tab" data-tab="skipped">已跳过</span>
+        </div>
+        <span class="bhq-header-spacer"></span>
+        <span class="bhq-header-btn" id="bhq-refresh" title="立即刷新">↻</span>
+        <span class="bhq-close" id="bhq-close">×</span>
+      </div>
+      <div class="bhq-toolbar">
+        <button class="bhq-act bhq-act-primary" id="bhq-rerank" style="display:none">AI 精评队列</button>
+        <button class="bhq-act bhq-act-primary" id="bhq-bulk-greet" style="display:none">一键打招呼</button>
+        <button class="bhq-act bhq-act-danger" id="bhq-bulk-greet-stop" style="display:none">停止打招呼</button>
+        <button class="bhq-act bhq-act-danger" id="bhq-bulk-skip" style="display:none">一键跳过</button>
+        <button class="bhq-act bhq-act-success" id="bhq-bulk-restore" style="display:none">一键恢复</button>
+        <span class="bhq-toolbar-status" id="bhq-toolbar-status">就绪</span>
+      </div>
+      <div class="bhq-progress-wrap" id="bhq-progress-wrap" style="display:none">
+        <div class="bhq-progress-bar"><div class="bhq-progress-fill" id="bhq-progress-fill"></div></div>
+        <span class="bhq-progress-text" id="bhq-progress-text"></span>
+      </div>
+      <div class="bhq-list" id="bhq-list"><div class="bhq-empty">加载中…</div></div>
+    `;
+    document.body.appendChild(el);
+
+    // Drag by header
+    const header = el.querySelector('.bhq-header');
+    let dragging = false, dx = 0, dy = 0;
+    header.addEventListener('mousedown', (e) => {
+      // Don't start drag when clicking interactive header controls
+      if (e.target.closest('.bhq-tab, .bhq-header-btn, .bhq-close')) return;
+      dragging = true;
+      const rect = el.getBoundingClientRect();
+      dx = e.clientX - rect.left;
+      dy = e.clientY - rect.top;
+    });
+    document.addEventListener('mousemove', (e) => {
+      if (!dragging) return;
+      el.style.left = (e.clientX - dx) + 'px';
+      el.style.top = (e.clientY - dy) + 'px';
+      el.style.right = 'auto';
+    });
+    document.addEventListener('mouseup', () => { dragging = false; });
+
+    // Tab switch
+    el.querySelectorAll('.bhq-tab').forEach(t => {
+      t.addEventListener('click', () => {
+        const tab = t.getAttribute('data-tab');
+        if (tab === state.queuePanel.tab) return;
+        if (state.queuePanel.bulkGreetRunning) {
+          showToast('批量打招呼进行中，请先停止', true);
+          return;
+        }
+        state.queuePanel.tab = tab;
+        el.querySelectorAll('.bhq-tab').forEach(x => {
+          x.classList.toggle('active', x.getAttribute('data-tab') === tab);
+        });
+        applyToolbarVisibility();
+        fetchQueue(true);  // full refresh on tab switch
+      });
+    });
+
+    // Header buttons
+    el.querySelector('#bhq-close').addEventListener('click', closeQueuePanel);
+    el.querySelector('#bhq-refresh').addEventListener('click', () => {
+      if (state.queuePanel.bulkGreetRunning) { showToast('批量打招呼进行中，请先停止', true); return; }
+      fetchQueue(true);
+    });
+    el.querySelector('#bhq-rerank').addEventListener('click', doLlmRerank);
+    el.querySelector('#bhq-bulk-greet').addEventListener('click', doBulkGreet);
+    el.querySelector('#bhq-bulk-greet-stop').addEventListener('click', doBulkGreetStop);
+    el.querySelector('#bhq-bulk-skip').addEventListener('click', () => doBulkStatus('skipped'));
+    el.querySelector('#bhq-bulk-restore').addEventListener('click', () => doBulkStatus('new'));
+
+    // Row click delegation (locate + action buttons)
+    el.querySelector('#bhq-list').addEventListener('click', onListClick);
+
+    applyToolbarVisibility();
+    return el;
+  }
+
+  function applyToolbarVisibility() {
+    const rerank = document.getElementById('bhq-rerank');
+    const bulkGreet = document.getElementById('bhq-bulk-greet');
+    const bulkSkip = document.getElementById('bhq-bulk-skip');
+    const bulkRestore = document.getElementById('bhq-bulk-restore');
+    if (!rerank) return;
+    const isQueue = state.queuePanel.tab === 'queue';
+    rerank.style.display = isQueue ? 'inline-block' : 'none';
+    bulkSkip.style.display = isQueue ? 'inline-block' : 'none';
+    bulkRestore.style.display = isQueue ? 'none' : 'inline-block';
+    if (bulkGreet) bulkGreet.style.display = (isQueue && !state.queuePanel.bulkGreetRunning) ? 'inline-block' : 'none';
+    updateBulkGreetButtons();
+  }
+
+  function openQueuePanel() {
+    const el = ensureQueuePanel();
+    // Layout: wide screen → side-by-side left of small panel; narrow → stacked
+    // below. Judged once on open (not on resize) — cheap & good enough.
+    const stacked = window.innerWidth < 1280;
+    el.classList.toggle('bhq-stacked', stacked);
+    if (stacked) {
+      const smallPanel = document.getElementById('boss-helper-panel');
+      const smallRect = smallPanel ? smallPanel.getBoundingClientRect() : { bottom: 80 };
+      el.style.top = (smallRect.bottom + 12) + 'px';
+      el.style.right = '20px';
+      el.style.left = 'auto';
+    } else {
+      el.style.top = '80px';
+      el.style.right = '372px';
+      el.style.left = 'auto';
+    }
+    el.style.display = 'flex';
+    state.queuePanel.open = true;
+    fetchQueue(true);
+    if (state.queuePanel.autoRefreshTimer) clearInterval(state.queuePanel.autoRefreshTimer);
+    state.queuePanel.autoRefreshTimer = setInterval(() => fetchQueue(false), 10000);
+  }
+
+  function closeQueuePanel() {
+    const el = document.getElementById('boss-helper-queue-panel');
+    if (el) el.style.display = 'none';
+    state.queuePanel.open = false;
+    if (state.queuePanel.autoRefreshTimer) {
+      clearInterval(state.queuePanel.autoRefreshTimer);
+      state.queuePanel.autoRefreshTimer = null;
+    }
+  }
+
+  function setQueueStatus(msg, err = false) {
+    const el = document.getElementById('bhq-toolbar-status');
+    if (!el) return;
+    el.textContent = msg;
+    el.className = err ? 'bhq-toolbar-status err' : 'bhq-toolbar-status';
+  }
+
+  function showToast(msg, err = false) {
+    let t = document.getElementById('bhq-toast');
+    if (!t) {
+      t = document.createElement('div');
+      t.id = 'bhq-toast';
+      t.className = 'bhq-toast';
+      document.body.appendChild(t);
+    }
+    t.textContent = msg;
+    t.className = 'bhq-toast show' + (err ? ' err' : '');
+    clearTimeout(t._hideTimer);
+    t._hideTimer = setTimeout(() => { t.className = 'bhq-toast'; }, 2200);
+  }
+
+  async function fetchQueue(showLoading) {
+    if (state.queuePanel.loading) return;
+    state.queuePanel.loading = true;
+    if (showLoading) setQueueStatus('加载中…');
+    const params = new URLSearchParams();
+    if (state.jobId) params.append('job_id', state.jobId);
+    if (state.queuePanel.tab === 'skipped') params.append('status_filter', 'skipped');
+    params.append('limit', '100');
+    try {
+      const items = await apiGetRoot('/queue/today?' + params.toString());
+      state.queuePanel.items = Array.isArray(items) ? items : [];
+      state.queuePanel.itemsById = new Map(state.queuePanel.items.map(x => [x.match_id, x]));
+      diffRenderQueueList(state.queuePanel.items);
+      setQueueStatus(`共 ${state.queuePanel.items.length} 条 · ${new Date().toLocaleTimeString()}`);
+    } catch (err) {
+      setQueueStatus('加载失败: ' + err.message, true);
+    } finally {
+      state.queuePanel.loading = false;
+    }
+  }
+
+  function scoreBadgeClass(s) {
+    if (s >= 80) return 'score-high';
+    if (s >= 60) return 'score-mid';
+    return 'score-low';
+  }
+  function llmBadgeClass(s) {
+    if (s >= 80) return 'llm-high';
+    if (s >= 60) return 'llm-mid';
+    return 'llm-low';
+  }
+  function esc(s) {
+    return String(s == null ? '' : s)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  }
+
+  function statusTitle(status) {
+    return ({
+      new: '新',
+      queued: '已入队',
+      drafted: '已生成话术',
+      filled: '已填入输入框',
+      sent_manual: '已发送',
+      skipped: '已跳过',
+    })[status] || status || '';
+  }
+
+  // Build the inline info line: age岁 · work_years · education · salary · city
+  function buildInfoLine(item) {
+    const parts = [];
+    if (item.age) parts.push(item.age + '岁');
+    if (item.work_years) parts.push(item.work_years);
+    if (item.education) parts.push(item.education);
+    if (item.salary_range) parts.push(item.salary_range);
+    if (item.expected_city) parts.push(item.expected_city);
+    return parts.join(' · ');
+  }
+
+  // Row template — minimal fields per v1 spec (no CheckBadges/skill tags/preview).
+  function buildRowHTML(item) {
+    const isSkipped = state.queuePanel.tab === 'skipped';
+    const reasonRaw = item.llm_reason || item.match_reason || '';
+    const reasonCls = item.llm_reason ? 'bhq-reason ai' : 'bhq-reason';
+    const reasonPrefix = item.llm_reason ? 'AI: ' : '';
+    const missingHtml = item.missing_info
+      ? `<div class="bhq-missing" title="${esc(item.missing_info)}">⚠ 缺：${esc(item.missing_info)}</div>` : '';
+    const llmBadge = (item.llm_score != null)
+      ? `<span class="bhq-badge ${llmBadgeClass(item.llm_score)}" title="AI 精评分">AI ${Math.round(item.llm_score)}</span>` : '';
+    const isSending = state.queuePanel.sendingId === item.match_id;
+    const actionBtns = isSkipped
+      ? `<button class="bhq-act bhq-act-success" data-act="restore" data-mid="${item.match_id}">恢复</button>`
+      : `
+        <button class="bhq-act bhq-act-primary" data-act="greet" data-mid="${item.match_id}"${isSending ? ' disabled' : ''}>${isSending ? '发送中…' : '打招呼'}</button>
+        <button class="bhq-act bhq-act-success" data-act="sent" data-mid="${item.match_id}">已发送</button>
+        <button class="bhq-act bhq-act-secondary" data-act="skip" data-mid="${item.match_id}">跳过</button>
+      `;
+    return `
+      <div class="bhq-row-main">
+        <div class="bhq-name-line">
+          <span class="bhq-status-dot ${item.status || 'new'}" title="${esc(statusTitle(item.status))}"></span>
+          <span class="bhq-name">${esc(item.name || '未知')}</span>
+          <span class="bhq-badge ${scoreBadgeClass(item.score)}" title="规则分">${Math.round(item.score)}</span>
+          ${llmBadge}
+          ${item.active_status ? `<span class="bhq-active">${esc(item.active_status)}</span>` : ''}
+        </div>
+        <div class="bhq-info">${esc(buildInfoLine(item))}</div>
+        ${reasonRaw ? `<div class="${reasonCls}" title="${esc(reasonRaw)}">${reasonPrefix}${esc(reasonRaw)}</div>` : ''}
+        ${missingHtml}
+      </div>
+      <div class="bhq-row-actions">${actionBtns}</div>
+    `;
+  }
+
+  // Cheap change-detection signature for a row (score+status+llm_score+reason+sending).
+  function rowSig(item) {
+    const sending = state.queuePanel.sendingId === item.match_id ? 1 : 0;
+    return `${item.status}|${item.score}|${item.llm_score ?? ''}|${item.llm_reason ?? ''}|${item.match_reason ?? ''}|${item.missing_info ?? ''}|${item.active_status ?? ''}|${sending}`;
+  }
+
+  // Incremental diff render: upsert / remove / move rows by match_id so scroll
+  // position and hover state survive the 10s auto-refresh.
+  function diffRenderQueueList(items) {
+    const listEl = document.getElementById('bhq-list');
+    if (!listEl) return;
+
+    if (!items.length) {
+      listEl.innerHTML = `<div class="bhq-empty">${state.queuePanel.tab === 'skipped' ? '暂无已跳过记录' : '队列为空（先在页面里扫描）'}</div>`;
+      return;
+    }
+
+    // Remove sentinel empty message if present
+    const empty = listEl.querySelector('.bhq-empty');
+    if (empty) empty.remove();
+
+    const existing = new Map();
+    for (const child of Array.from(listEl.children)) {
+      const mid = child.getAttribute('data-mid');
+      if (mid) existing.set(Number(mid), child);
+    }
+
+    const wantedIds = new Set(items.map(i => i.match_id));
+    // Remove rows that no longer belong
+    for (const [mid, node] of existing) {
+      if (!wantedIds.has(mid)) node.remove();
+    }
+
+    let prev = null;
+    for (const item of items) {
+      let node = existing.get(item.match_id);
+      if (!node) {
+        node = document.createElement('div');
+        node.className = 'bhq-row';
+        node.setAttribute('data-mid', String(item.match_id));
+        if (item.boss_id) node.setAttribute('data-bossid', item.boss_id);
+        node.innerHTML = buildRowHTML(item);
+        node._sig = rowSig(item);
+      } else {
+        // Update only if content signature changed (cheap: score+status+llm_score+reason)
+        const sig = rowSig(item);
+        if (node._sig !== sig) {
+          node.innerHTML = buildRowHTML(item);
+          if (item.boss_id) node.setAttribute('data-bossid', item.boss_id);
+        }
+        node._sig = sig;
+      }
+      // Ensure DOM order matches items[]
+      const nextSibling = prev ? prev.nextSibling : listEl.firstChild;
+      if (nextSibling !== node) listEl.insertBefore(node, nextSibling);
+      prev = node;
+    }
+  }
+
+  // Click dispatcher: action buttons intercepted first; otherwise treat the
+  // row click as "locate this candidate's card on the current BOSS page".
+  function onListClick(e) {
+    const actBtn = e.target.closest('button[data-act]');
+    if (actBtn) {
+      e.stopPropagation();
+      const mid = Number(actBtn.getAttribute('data-mid'));
+      const act = actBtn.getAttribute('data-act');
+      const item = state.queuePanel.itemsById.get(mid);
+      if (!item) return;
+      if (state.queuePanel.bulkGreetRunning && act !== 'restore') {
+        showToast('批量打招呼进行中，请稍候', true);
+        return;
+      }
+      if (act === 'greet') return handleGreet(item);
+      if (act === 'sent') return handleStatusChange(item, 'sent_manual');
+      if (act === 'skip') return handleStatusChange(item, 'skipped');
+      if (act === 'restore') return handleStatusChange(item, 'new');
+      return;
+    }
+    const row = e.target.closest('.bhq-row');
+    if (!row) return;
+    const mid = Number(row.getAttribute('data-mid'));
+    const item = state.queuePanel.itemsById.get(mid);
+    if (!item || !item.boss_id) { showToast('该候选人无 boss_id，无法定位', true); return; }
+    locateCardOnPage(item);
+  }
+
+  // Single place that performs a real send for a queue item — used by both
+  // handleGreet (mode: 'manual') and doBulkGreet (mode: 'auto').
+  //
+  // Probe flow (BOSS 推荐页限制：点"打招呼"要么弹出可编辑招呼框、要么直接发
+  // 送后台配置的招呼语，无法在发送前插入自定义文本):
+  //   1. Trigger BOSS's greet UI (native 打招呼 button, or resume-panel button).
+  //   2. Poll up to 5s for an editable chat/greet input to appear.
+  //      - Appears  → this account supports custom greetings: fill our
+  //        template + click send.  reason: ok.
+  //      - Never appears → the account sent its default 招呼语 immediately;
+  //        we CANNOT inject the template.  reason: 'no_editable' (do NOT mark
+  //        as sent — BOSS blocks re-greeting anyway, so no dup risk).
+  async function sendGreetingToItem(item, opts) {
+    const mode = (opts && opts.mode) || 'manual';
+
+    if (state.greetingCount >= state.dailyCap) {
+      return { ok: false, reason: 'cap' };
+    }
+
+    const hazard = checkHazards();
+    if (hazard) {
+      return { ok: false, reason: 'hazard', detail: hazard };
+    }
+
+    const target = findCardByBossId(item.boss_id);
+    if (!target) {
+      return { ok: false, reason: 'not_found' };
+    }
+
+    let draftText = '';
+    try {
+      const res = await apiPostRoot(`/outreach/${item.match_id}/draft`, {});
+      draftText = (res && res.draft_text) || '';
+    } catch (err) {
+      return { ok: false, reason: 'error', detail: err.message };
+    }
+    if (!draftText) {
+      return { ok: false, reason: 'error', detail: '话术为空' };
+    }
+
+    // 1) Trigger BOSS's greet flow.
+    const triggered = await triggerGreetUI(target);
+    if (!triggered) {
+      dumpChatInputDiag();
+      return { ok: false, reason: 'no_greet_btn', detail: '未找到打招呼按钮，诊断已复制' };
+    }
+
+    if (document.hidden) await waitForVisible();
+
+    // 2) Wait for an editable greet/chat input to appear.
+    const input = await waitForChatInput(5000);
+    if (!input) {
+      dumpChatInputDiag();
+      // No editable box → account sends its default 招呼语 on click. Nothing
+      // we can inject; leave status untouched so it's not falsely "sent".
+      return { ok: false, reason: 'no_editable', detail: '账号点打招呼直接发默认招呼语，无法插入模板' };
+    }
+
+    // 3) Editable box present → fill our template and send.
+    fillInputEl(input, draftText);
+    await sleep(500);
+
+    const sendBtn = findSendButton();
+    if (!sendBtn) {
+      dumpChatInputDiag();
+      return { ok: false, reason: 'no_input', detail: '找到招呼框但没有发送按钮，诊断已复制' };
+    }
+    sendBtn.click();
+
+    incrCounter();
+    const countEl = document.getElementById('bh-count');
+    if (countEl) countEl.textContent = state.greetingCount;
+
+    try {
+      await apiPost('/log-greeting', {
+        expectId: item.boss_id,
+        name: item.name,
+        mode,
+        job_id: item.job_id,
+      });
+    } catch { /* non-critical, mirrors doAutoStart's existing tolerance */ }
+
+    item.status = mode === 'auto' ? 'sent_auto' : 'sent_manual';
+    return { ok: true };
+  }
+
+  // Human-readable failure text for sendGreetingToItem's structured result.
+  function greetFailMessage(res, item) {
+    if (res.reason === 'not_found') return `未找到卡片，可能已翻页：${item.name}`;
+    if (res.reason === 'hazard') return `检测到风控阻断(${res.detail})，已停止`;
+    if (res.reason === 'cap') return '已达每日上限';
+    if (res.reason === 'no_greet_btn') return `未找到打招呼按钮：${item.name}（诊断已复制）`;
+    if (res.reason === 'no_editable') return `你的账号点"打招呼"是直接发送默认招呼语，无法插入自定义模板`;
+    if (res.reason === 'no_input') return `找到招呼框但没有发送按钮：${item.name}`;
+    return `打招呼失败：${item.name}` + (res.detail ? `（${res.detail}）` : '');
+  }
+
+  async function handleGreet(item) {
+    if (state.autoRunning || state.queuePanel.bulkGreetRunning || state.queuePanel.sendingId) {
+      showToast('自动/批量打招呼进行中，请稍后再试', true);
+      return;
+    }
+    if (state.greetingCount >= state.dailyCap) {
+      showToast('已达每日上限', true);
+      return;
+    }
+    // sendingId flows into rowSig (see buildRowHTML/rowSig), so the row's
+    // disabled/"发送中…" state survives even if a concurrent 10s poll
+    // rebuilds this row's DOM node mid-send.
+    state.queuePanel.sendingId = item.match_id;
+    diffRenderQueueList(state.queuePanel.items);
+    setQueueStatus(`正在打招呼: ${item.name}…`);
+    try {
+      const res = await sendGreetingToItem(item, { mode: 'manual' });
+      if (res.ok) {
+        showToast(`已打招呼：${item.name}`);
+        setQueueStatus(`已打招呼：${item.name}`);
+        // Optimistic removal — mirrors handleStatusChange: a sent item no
+        // longer belongs in the 队列 tab (server-side filtering would drop
+        // it on the next fetch anyway; do it now so the row disappears
+        // immediately instead of staying visible-but-stale).
+        state.queuePanel.items = state.queuePanel.items.filter(x => x.match_id !== item.match_id);
+        state.queuePanel.itemsById.delete(item.match_id);
+      } else {
+        const msg = greetFailMessage(res, item);
+        setQueueStatus(msg, true);
+        showToast(msg, true);
+      }
+    } catch (err) {
+      setQueueStatus('打招呼失败: ' + err.message, true);
+      showToast('打招呼失败: ' + err.message, true);
+    } finally {
+      state.queuePanel.sendingId = null;
+      diffRenderQueueList(state.queuePanel.items);
+    }
+  }
+
+  // Optimistic single-row status change: remove from current view (both tabs
+  // would filter it out anyway), revert on failure.
+  async function handleStatusChange(item, newStatus) {
+    const listEl = document.getElementById('bhq-list');
+    const node = listEl && listEl.querySelector(`[data-mid="${item.match_id}"]`);
+    if (node) node.style.opacity = '0.4';
+    try {
+      await apiPatchRoot(`/outreach/${item.match_id}/status`, { status: newStatus });
+      // Remove from local list (queue tab filters out sent/skipped;
+      // skipped tab filters in only skipped so restore→new also leaves).
+      state.queuePanel.items = state.queuePanel.items.filter(x => x.match_id !== item.match_id);
+      state.queuePanel.itemsById.delete(item.match_id);
+      diffRenderQueueList(state.queuePanel.items);
+      setQueueStatus(`已更新: ${item.name} → ${statusTitle(newStatus)}`);
+    } catch (err) {
+      if (node) node.style.opacity = '';
+      setQueueStatus('操作失败: ' + err.message, true);
+      showToast('操作失败: ' + err.message, true);
+    }
+  }
+
+  async function doBulkStatus(newStatus) {
+    const items = state.queuePanel.items;
+    if (!items.length) { showToast('列表为空', true); return; }
+    const verb = newStatus === 'skipped' ? '跳过' : '恢复';
+    if (!window.confirm(`确定要一键${verb}当前列表中的 ${items.length} 位候选人吗？`)) return;
+    setQueueStatus(`正在${verb} ${items.length} 位…`);
+    try {
+      const match_ids = items.map(x => x.match_id);
+      await apiPatchRoot('/outreach/bulk-status', { match_ids, status: newStatus });
+      setQueueStatus(`已${verb} ${items.length} 位候选人`);
+      showToast(`已${verb} ${items.length} 位`);
+      await fetchQueue(true);
+    } catch (err) {
+      setQueueStatus(`一键${verb}失败: ` + err.message, true);
+      showToast(`一键${verb}失败: ` + err.message, true);
+    }
+  }
+
+  function updateBulkGreetButtons() {
+    const startBtn = document.getElementById('bhq-bulk-greet');
+    const stopBtn = document.getElementById('bhq-bulk-greet-stop');
+    if (!startBtn || !stopBtn) return;
+    startBtn.style.display = state.queuePanel.bulkGreetRunning ? 'none' : 'inline-block';
+    stopBtn.style.display = state.queuePanel.bulkGreetRunning ? 'inline-block' : 'none';
+  }
+
+  // The queue panel auto-refreshes every 10s (fetchQueue) which overwrites
+  // state.queuePanel.items — pause it for the duration of a bulk run so it
+  // can't clobber the list a running loop is iterating over.
+  function pauseQueueAutoRefresh() {
+    if (state.queuePanel.autoRefreshTimer) {
+      clearInterval(state.queuePanel.autoRefreshTimer);
+      state.queuePanel.autoRefreshTimer = null;
+    }
+  }
+  function resumeQueueAutoRefresh() {
+    if (state.queuePanel.open && !state.queuePanel.autoRefreshTimer) {
+      state.queuePanel.autoRefreshTimer = setInterval(() => fetchQueue(false), 10000);
+    }
+  }
+
+  function showProgress(done, total, label) {
+    const wrap = document.getElementById('bhq-progress-wrap');
+    const fill = document.getElementById('bhq-progress-fill');
+    const text = document.getElementById('bhq-progress-text');
+    if (!wrap) return;
+    wrap.style.display = 'flex';
+    const pct = total > 0 ? Math.round((done / total) * 100) : 0;
+    if (fill) fill.style.width = pct + '%';
+    if (text) text.textContent = `${label} (${done}/${total})`;
+  }
+  function hideProgress() {
+    const wrap = document.getElementById('bhq-progress-wrap');
+    if (wrap) wrap.style.display = 'none';
+  }
+
+  async function doBulkGreet() {
+    if (state.autoRunning || state.queuePanel.bulkGreetRunning) {
+      showToast('已有打招呼任务在运行', true);
+      return;
+    }
+    const allItems = state.queuePanel.items.filter(x => x && x.boss_id);
+    if (!allItems.length) { showToast('列表为空', true); return; }
+
+    const remainingCap = Math.max(0, state.dailyCap - state.greetingCount);
+    if (remainingCap === 0) { showToast('已达每日上限', true); return; }
+
+    const runCount = Math.min(allItems.length, remainingCap);
+    const estMinLow = Math.max(1, Math.round(runCount * state.delayMin / 60));
+    const estMinHigh = Math.max(1, Math.round(runCount * state.delayMax / 60));
+    const capNote = runCount < allItems.length
+      ? `（受今日上限限制，仅处理前 ${runCount}/${allItems.length} 位）` : '';
+    const confirmMsg =
+      `即将对 ${runCount} 位候选人依次打招呼${capNote}\n` +
+      `每人间隔 ${state.delayMin}-${state.delayMax} 秒，预计耗时约 ${estMinLow}-${estMinHigh} 分钟。\n` +
+      `发送内容为系统生成的模板话术，过程中可随时点击"停止打招呼"中断。是否继续？`;
+    if (!window.confirm(confirmMsg)) return;
+
+    // Snapshot: the loop works off this fixed array so the paused-but-just-
+    // in-case-late auto-refresh or other mutations can't shift indices mid-run.
+    const queue = allItems.slice(0, runCount);
+
+    state.queuePanel.bulkGreetRunning = true;
+    updateBulkGreetButtons();
+    pauseQueueAutoRefresh();
+
+    let sent = 0, notFound = 0, failed = 0;
+    showProgress(0, queue.length, '准备中…');
+
+    for (let i = 0; i < queue.length; i++) {
+      if (!state.queuePanel.bulkGreetRunning) break;
+
+      if (state.greetingCount >= state.dailyCap) {
+        setQueueStatus('已达每日上限，批量打招呼自动停止');
+        break;
+      }
+
+      // Re-read from itemsById: sendGreetingToItem mutates item.status in
+      // place, and this keeps the loop working off the live object the UI
+      // renders even though membership/order comes from the fixed snapshot.
+      const item = state.queuePanel.itemsById.get(queue[i].match_id) || queue[i];
+
+      state.queuePanel.sendingId = item.match_id;
+      showProgress(i, queue.length, `正在打招呼: ${item.name}`);
+
+      const res = await sendGreetingToItem(item, { mode: 'auto' });
+      if (res.ok) {
+        sent++;
+        state.queuePanel.items = state.queuePanel.items.filter(x => x.match_id !== item.match_id);
+        state.queuePanel.itemsById.delete(item.match_id);
+      } else if (res.reason === 'not_found') {
+        notFound++;
+      } else if (res.reason === 'hazard') {
+        failed++;
+        setQueueStatus(`检测到风控阻断(${res.detail})，批量打招呼已停止`, true);
+        state.queuePanel.sendingId = null;
+        state.queuePanel.bulkGreetRunning = false;
+        break;
+      } else if (res.reason === 'cap') {
+        setQueueStatus('已达每日上限，批量打招呼自动停止');
+        state.queuePanel.sendingId = null;
+        break;
+      } else if (res.reason === 'no_editable') {
+        // Account sends its default 招呼语 on click — custom templates aren't
+        // possible on this page. No point continuing the whole batch.
+        setQueueStatus('你的账号点"打招呼"直接发默认招呼语，无法插入模板，已停止', true);
+        showToast('账号不支持自定义招呼语，已停止批量', true);
+        state.queuePanel.sendingId = null;
+        state.queuePanel.bulkGreetRunning = false;
+        break;
+      } else {
+        failed++;
+      }
+
+      state.queuePanel.sendingId = null;
+      diffRenderQueueList(state.queuePanel.items);
+      showProgress(i + 1, queue.length, `${item.name} 已处理`);
+
+      if (i < queue.length - 1 && state.queuePanel.bulkGreetRunning) {
+        const delay = randDelay();
+        showProgress(i + 1, queue.length, `等待 ${Math.round(delay / 1000)} 秒…`);
+        await sleep(delay);
+      }
+    }
+
+    state.queuePanel.bulkGreetRunning = false;
+    state.queuePanel.sendingId = null;
+    updateBulkGreetButtons();
+    resumeQueueAutoRefresh();
+    hideProgress();
+
+    const summary = `批量打招呼完成：已发送 ${sent} 人` +
+      (notFound ? `，未找到 ${notFound} 人` : '') +
+      (failed ? `，失败 ${failed} 人` : '');
+    setQueueStatus(summary, failed > 0 || notFound > 0);
+    showToast(summary, failed > 0);
+    await fetchQueue(true);
+  }
+
+  function doBulkGreetStop() {
+    state.queuePanel.bulkGreetRunning = false;
+    setQueueStatus('正在停止批量打招呼…');
+  }
+
+  async function doLlmRerank() {
+    if (state.queuePanel.llmBusy) return;
+    const btn = document.getElementById('bhq-rerank');
+    if (!state.jobId) { showToast('未选择岗位', true); return; }
+    state.queuePanel.llmBusy = true;
+    if (btn) { btn.disabled = true; btn.textContent = 'AI 评分中…'; }
+    setQueueStatus('AI 精评队列中，可能需要 1-3 分钟…');
+    try {
+      // /llm-rerank lives under /api/ext — reuse old apiPost (with /ext prefix).
+      // Backend returns 200 with {configured:false, error} when LLM isn't set.
+      const res = await apiPost('/llm-rerank', { job_id: state.jobId, limit: 60 });
+      if (res && res.configured === false) {
+        const msg = res.error || 'LLM 未配置';
+        setQueueStatus(msg, true);
+        showToast(msg, true);
+        return;
+      }
+      if (res && res.error) {
+        setQueueStatus('AI 精评失败: ' + res.error, true);
+        showToast('AI 精评失败: ' + res.error, true);
+        return;
+      }
+      const scored = (res && (res.scored ?? 0));
+      showToast(`AI 精评完成：${scored} 人`);
+      setQueueStatus(`AI 精评完成：${scored} 人`);
+      await fetchQueue(true);
+    } catch (err) {
+      setQueueStatus('AI 精评失败: ' + err.message, true);
+      showToast('AI 精评失败: ' + err.message, true);
+    } finally {
+      state.queuePanel.llmBusy = false;
+      if (btn) { btn.disabled = false; btn.textContent = 'AI 精评队列'; }
+    }
+  }
+
+  // Locate a card on the current BOSS page by boss_id (data-expect / data-geek),
+  // scroll+highlight it, AND open the candidate's resume/chat popup (same as the
+  // old cross-tab "跳转到 BOSS" behavior in pollPendingOpen) — row click should
+  // do both, not just scroll.
+  // 1) Prefer the cardEl reference cached in state.scanned (fresh, no re-query).
+  // 2) Fallback: scan all CARD_SEL elements — queue items may be from prior
+  //    scans and the current page might not have been scanned this session.
+  function locateCardOnPage(item) {
+    const target = findCardByBossId(item.boss_id);
+    if (!target) {
+      showToast('未找到卡片，可能已翻页/未扫描到本页', true);
+      return;
+    }
+    try { target.scrollIntoView({ behavior: 'smooth', block: 'center' }); } catch {}
+    target.classList.add('bhq-located');
+    setTimeout(() => target.classList.remove('bhq-located'), 2000);
+    openCardChat(target);
+    setQueueStatus(`已定位并打开简历：${item.name || ''}`);
   }
 
   bindBadgeListeners();
