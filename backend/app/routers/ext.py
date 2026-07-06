@@ -354,6 +354,42 @@ def ext_llm_draft(req: ExtDraftRequest, db: Session = Depends(get_db)):
     return {"draft": draft, "source": source}
 
 
+# ── Cross-tab "jump to BOSS" relay ─────────────────────────────────────
+# Dashboard (localhost:5173/8000) and the BOSS tab (zhipin.com) are separate
+# origins/tabs with no direct channel between them. The Dashboard posts a
+# "please open this candidate" request here; the userscript polls this from
+# inside the BOSS tab and, if that candidate's card is still on screen,
+# clicks it open and focuses the tab. Best-effort only: requires the BOSS tab
+# (with that candidate's card still rendered) to still be open somewhere.
+# Single in-memory slot is enough — this is a local single-user app.
+
+_pending_open: dict | None = None
+
+
+class OpenCandidateRequest(BaseModel):
+    boss_id: str
+    name: str = ""
+
+
+@router.post("/open-candidate")
+def ext_open_candidate(req: OpenCandidateRequest):
+    """Dashboard calls this on row click to request a cross-tab jump."""
+    global _pending_open
+    if not req.boss_id:
+        return {"ok": False, "error": "缺少 boss_id"}
+    _pending_open = {"boss_id": req.boss_id, "name": req.name}
+    return {"ok": True}
+
+
+@router.get("/pending-open")
+def ext_pending_open():
+    """Userscript polls this; the request is consumed on read (fires once)."""
+    global _pending_open
+    pending = _pending_open
+    _pending_open = None
+    return pending or {"boss_id": ""}
+
+
 # ── GET /api/ext/jobs ────────────────────────────────────────────────
 
 @router.get("/jobs")

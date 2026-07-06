@@ -59,6 +59,6 @@ greeting:
 
 automation:
   score_threshold: 70
-  daily_cap: 50
+  daily_cap: 150
   delay_min_s: 5
   delay_max_s: 15

@@ -1,31 +1,7 @@
 import { Outlet, Link, useLocation } from 'react-router-dom';
-import { useEffect, useRef, useState } from 'react';
-import CandidateDetail from './CandidateDetail';
-import type { QueueItem } from '../api';
 
 export default function Layout() {
   const location = useLocation();
-  const [selectedCandidate, setSelectedCandidate] = useState<QueueItem | null>(null);
-  const drawerRef = useRef<HTMLDivElement>(null);
-
-  // Close the detail drawer whenever the route changes (e.g. top nav click).
-  useEffect(() => {
-    setSelectedCandidate(null);
-  }, [location.pathname]);
-
-  // Close on click outside the drawer. Uses mousedown (fires before a row's
-  // own click handler) so clicking a different row still switches candidates
-  // instead of being cancelled out by this closing first.
-  useEffect(() => {
-    if (!selectedCandidate) return;
-    const handleMouseDown = (e: MouseEvent) => {
-      if (drawerRef.current && !drawerRef.current.contains(e.target as Node)) {
-        setSelectedCandidate(null);
-      }
-    };
-    document.addEventListener('mousedown', handleMouseDown);
-    return () => document.removeEventListener('mousedown', handleMouseDown);
-  }, [selectedCandidate]);
 
   const navLink = (path: string, label: string) => (
     <Link
@@ -57,17 +33,8 @@ export default function Layout() {
         </div>
       </header>
       <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6">
-        <Outlet context={{ selectedCandidate, setSelectedCandidate }} />
+        <Outlet />
       </main>
-
-      {selectedCandidate && (
-        <div ref={drawerRef}>
-          <CandidateDetail
-            item={selectedCandidate}
-            onClose={() => setSelectedCandidate(null)}
-          />
-        </div>
-      )}
     </div>
   );
 }
