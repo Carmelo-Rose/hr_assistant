@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name         BOSS 招聘助手 — 油猴版
 // @namespace    https://github.com/hr_assistant
-// @version      1.20.0
-// @description  在 BOSS 直聘页面内扫描候选人、评分、辅助/自动打招呼
+// @version      1.20.4
+// @description  在 BOSS 直聘页面内扫描候选人、评分、队列复盘、辅助话术
 // @match        https://www.zhipin.com/*
 // @noframes
-// @connect      localhost
-// @updateURL    http://localhost:8000/boss-helper.user.js
-// @downloadURL  http://localhost:8000/boss-helper.user.js
+// @connect      *
+// @updateURL    __BOSS_HELPER_BASE_URL__/boss-helper.user.js
+// @downloadURL  __BOSS_HELPER_BASE_URL__/boss-helper.user.js
 // @grant        GM_xmlhttpRequest
 // @grant        GM_setValue
 // @grant        GM_getValue
@@ -26,10 +26,24 @@
   window.__bhRunning = true;
 
   // ─── Configuration ────────────────────────────────────────────────
-  const BACKEND = 'http://localhost:8000/api/ext';
+  const DEFAULT_BACKEND_ORIGIN = '__BOSS_HELPER_BASE_URL__';
+  function getBackendOrigin() {
+    if (DEFAULT_BACKEND_ORIGIN && !DEFAULT_BACKEND_ORIGIN.includes('__')) {
+      return DEFAULT_BACKEND_ORIGIN.replace(/\/+$/, '');
+    }
+    const info = typeof GM_info !== 'undefined' ? GM_info : null;
+    const scriptUrl = info && info.script && (info.script.downloadURL || info.script.updateURL);
+    if (scriptUrl) {
+      try { return new URL(scriptUrl).origin; } catch { /* fall through */ }
+    }
+    return 'http://localhost:8000';
+  }
+
+  const BACKEND_ORIGIN = getBackendOrigin();
+  const BACKEND = `${BACKEND_ORIGIN}/api/ext`;
   // Root API (without /ext prefix) — used by the in-panel queue view for
   // /queue/today, /outreach/*. Old BACKEND stays for the scan/greet flow.
-  const BACKEND_ROOT = 'http://localhost:8000/api';
+  const BACKEND_ROOT = `${BACKEND_ORIGIN}/api`;
   // `li.card-item` = 新版推荐/沟通页卡片（2026-07 起）；`li.geek-info-card` = 旧版人才库搜索页卡片。
   // 两个选择器并存，哪个页面用哪套 DOM 就匹配哪个。
   const CARD_SEL = 'li.card-item, li.geek-info-card';
@@ -37,7 +51,7 @@
   // ─── State ────────────────────────────────────────────────────────
   const state = {
     scanned: [],       // [{expectId, name, score, is_blocked, details, draft, cardEl}]
-    mode: 'semi',      // 'semi' | 'auto'
+    mode: 'semi',      // legacy: 'semi' | 'auto'
     jobId: '',         // selected workbench job id (scoring profile)
     jobs: [],          // [{id, title}]
     llmEnabled: false, // backend has LLM configured → personalize greetings
@@ -48,7 +62,7 @@
     greetingCount: 0,
     autoRunning: false,
     multiPage: true,      // auto-scroll to load more before scoring
-    maxCandidates: 300,   // stop loading after roughly this many cards
+    maxCandidates: 50,    // stop auto-loading after roughly this many cards
     configLoaded: false,
     todayKey: new Date().toISOString().slice(0, 10),
   };
@@ -838,7 +852,7 @@
   // ─── Panel HTML ───────────────────────────────────────────────────
   GM_addStyle(`
     #boss-helper-panel {
-      position: fixed; top: 80px; right: 20px; z-index: 99999;
+      position: fixed; top: 200px; right: 20px; z-index: 99999;
       width: 340px; background: #fff; border-radius: 12px;
       box-shadow: 0 4px 24px rgba(0,0,0,.18); font-family: -apple-system, sans-serif;
       font-size: 13px; color: #333; user-select: none;
@@ -890,7 +904,7 @@
 
     /* ─── Queue panel ─────────────────────────────────────────────── */
     #boss-helper-queue-panel {
-      position: fixed; top: 80px; right: 372px; z-index: 99998;
+      position: fixed; top: 200px; right: 372px; z-index: 99998;
       width: 780px; max-height: 82vh;
       display: none; flex-direction: column;
       background: #fff; border-radius: 12px;
@@ -1044,23 +1058,14 @@
           <span id="bh-threshold-val">${state.threshold}</span>
         </div>
         <div class="bh-row">
-          <label>模式</label>
-          <select id="bh-mode">
-            <option value="semi">半自动</option>
-            <option value="auto">自动打招呼</option>
-          </select>
-        </div>
-        <div class="bh-row">
           <label>自动加载</label>
           <input type="checkbox" id="bh-multipage" ${state.multiPage ? 'checked' : ''}>
-          <span style="font-size:11px;color:#999">最多</span>
-          <input type="number" id="bh-maxcand" value="${state.maxCandidates}" min="15" max="2000" step="15" style="width:56px">
+          <span style="font-size:11px;color:#999">加载上限</span>
+          <input type="number" id="bh-maxcand" value="${state.maxCandidates}" min="15" max="500" step="5" style="width:56px">
           <span style="font-size:11px;color:#999">人</span>
         </div>
         <div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap;">
           <button class="bh-btn bh-btn-primary" id="bh-scan">扫描列表</button>
-          <button class="bh-btn bh-btn-primary" id="bh-start" style="display:none">开始</button>
-          <button class="bh-btn bh-btn-danger" id="bh-stop" style="display:none">停止</button>
           <button class="bh-btn bh-btn-secondary" id="bh-open-queue">查看队列</button>
           <button class="bh-btn bh-btn-secondary" id="bh-diag">诊断</button>
         </div>
@@ -1111,38 +1116,33 @@
       thresholdValEl.textContent = state.threshold;
     });
 
-    document.getElementById('bh-mode').addEventListener('change', (e) => {
-      state.mode = e.target.value;
-      updateAutoButtons();
-    });
-
     document.getElementById('bh-multipage').addEventListener('change', (e) => {
       state.multiPage = e.target.checked;
+      syncAutoLoadControls();
     });
     document.getElementById('bh-maxcand').addEventListener('change', (e) => {
-      state.maxCandidates = parseInt(e.target.value) || 300;
+      const next = parseInt(e.target.value, 10);
+      state.maxCandidates = Number.isFinite(next) ? Math.max(15, Math.min(500, next)) : 50;
+      e.target.value = state.maxCandidates;
     });
 
     document.getElementById('bh-scan').addEventListener('click', doScan);
-    document.getElementById('bh-start').addEventListener('click', doAutoStart);
-    document.getElementById('bh-stop').addEventListener('click', doAutoStop);
     document.getElementById('bh-diag').addEventListener('click', diagnose);
     document.getElementById('bh-open-queue').addEventListener('click', openQueuePanel);
 
-    updateAutoButtons();
+    syncAutoLoadControls();
     return panel;
   }
 
   function updateAutoButtons() {
-    const startBtn = document.getElementById('bh-start');
-    const stopBtn = document.getElementById('bh-stop');
-    if (state.mode === 'auto') {
-      startBtn.style.display = state.autoRunning ? 'none' : 'inline-block';
-      stopBtn.style.display = state.autoRunning ? 'inline-block' : 'none';
-    } else {
-      startBtn.style.display = 'none';
-      stopBtn.style.display = 'none';
-    }
+    // Legacy auto-greet buttons were removed from the UI.
+  }
+
+  function syncAutoLoadControls() {
+    const maxEl = document.getElementById('bh-maxcand');
+    if (!maxEl) return;
+    maxEl.disabled = !state.multiPage;
+    maxEl.title = state.multiPage ? '自动加载最多拉取的人数' : '关闭自动加载时，仅扫描当前页面已加载的候选人';
   }
 
   function setStatus(msg, err = false) {
@@ -1533,8 +1533,6 @@
       </div>
       <div class="bhq-toolbar">
         <button class="bhq-act bhq-act-primary" id="bhq-rerank" style="display:none">AI 精评队列</button>
-        <button class="bhq-act bhq-act-primary" id="bhq-bulk-greet" style="display:none">一键打招呼</button>
-        <button class="bhq-act bhq-act-danger" id="bhq-bulk-greet-stop" style="display:none">停止打招呼</button>
         <button class="bhq-act bhq-act-danger" id="bhq-bulk-skip" style="display:none">一键跳过</button>
         <button class="bhq-act bhq-act-success" id="bhq-bulk-restore" style="display:none">一键恢复</button>
         <span class="bhq-toolbar-status" id="bhq-toolbar-status">就绪</span>
@@ -1591,8 +1589,6 @@
       fetchQueue(true);
     });
     el.querySelector('#bhq-rerank').addEventListener('click', doLlmRerank);
-    el.querySelector('#bhq-bulk-greet').addEventListener('click', doBulkGreet);
-    el.querySelector('#bhq-bulk-greet-stop').addEventListener('click', doBulkGreetStop);
     el.querySelector('#bhq-bulk-skip').addEventListener('click', () => doBulkStatus('skipped'));
     el.querySelector('#bhq-bulk-restore').addEventListener('click', () => doBulkStatus('new'));
 
@@ -1605,7 +1601,6 @@
 
   function applyToolbarVisibility() {
     const rerank = document.getElementById('bhq-rerank');
-    const bulkGreet = document.getElementById('bhq-bulk-greet');
     const bulkSkip = document.getElementById('bhq-bulk-skip');
     const bulkRestore = document.getElementById('bhq-bulk-restore');
     if (!rerank) return;
@@ -1613,8 +1608,6 @@
     rerank.style.display = isQueue ? 'inline-block' : 'none';
     bulkSkip.style.display = isQueue ? 'inline-block' : 'none';
     bulkRestore.style.display = isQueue ? 'none' : 'inline-block';
-    if (bulkGreet) bulkGreet.style.display = (isQueue && !state.queuePanel.bulkGreetRunning) ? 'inline-block' : 'none';
-    updateBulkGreetButtons();
   }
 
   function openQueuePanel() {
@@ -1630,7 +1623,7 @@
       el.style.right = '20px';
       el.style.left = 'auto';
     } else {
-      el.style.top = '80px';
+      el.style.top = '200px';
       el.style.right = '372px';
       el.style.left = 'auto';
     }
@@ -1741,11 +1734,9 @@
       ? `<div class="bhq-missing" title="${esc(item.missing_info)}">⚠ 缺：${esc(item.missing_info)}</div>` : '';
     const llmBadge = (item.llm_score != null)
       ? `<span class="bhq-badge ${llmBadgeClass(item.llm_score)}" title="AI 精评分">AI ${Math.round(item.llm_score)}</span>` : '';
-    const isSending = state.queuePanel.sendingId === item.match_id;
     const actionBtns = isSkipped
       ? `<button class="bhq-act bhq-act-success" data-act="restore" data-mid="${item.match_id}">恢复</button>`
       : `
-        <button class="bhq-act bhq-act-primary" data-act="greet" data-mid="${item.match_id}"${isSending ? ' disabled' : ''}>${isSending ? '发送中…' : '打招呼'}</button>
         <button class="bhq-act bhq-act-success" data-act="sent" data-mid="${item.match_id}">已发送</button>
         <button class="bhq-act bhq-act-secondary" data-act="skip" data-mid="${item.match_id}">跳过</button>
       `;
@@ -1839,7 +1830,6 @@
         showToast('批量打招呼进行中，请稍候', true);
         return;
       }
-      if (act === 'greet') return handleGreet(item);
       if (act === 'sent') return handleStatusChange(item, 'sent_manual');
       if (act === 'skip') return handleStatusChange(item, 'skipped');
       if (act === 'restore') return handleStatusChange(item, 'new');
@@ -2030,11 +2020,7 @@
   }
 
   function updateBulkGreetButtons() {
-    const startBtn = document.getElementById('bhq-bulk-greet');
-    const stopBtn = document.getElementById('bhq-bulk-greet-stop');
-    if (!startBtn || !stopBtn) return;
-    startBtn.style.display = state.queuePanel.bulkGreetRunning ? 'none' : 'inline-block';
-    stopBtn.style.display = state.queuePanel.bulkGreetRunning ? 'inline-block' : 'none';
+    // Legacy bulk-greet controls were removed from the queue UI.
   }
 
   // The queue panel auto-refreshes every 10s (fetchQueue) which overwrites

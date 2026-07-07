@@ -21,6 +21,20 @@ from app.routers import jobs, candidates, queue, outreach, browser, config, ext
 ROOT_DIR = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", ".."))
 USERSCRIPT_PATH = os.path.join(ROOT_DIR, "userscript", "boss-helper.user.js")
 FRONTEND_DIST = os.path.join(ROOT_DIR, "frontend", "dist")
+PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "http://localhost:8000").rstrip("/")
+
+
+def _cors_origins() -> list[str]:
+    origins = [
+        "http://localhost:5173",
+        "http://localhost:3000",
+        "https://www.zhipin.com",
+    ]
+    if PUBLIC_BASE_URL:
+        origins.append(PUBLIC_BASE_URL)
+    extra = os.environ.get("CORS_ORIGINS", "")
+    origins.extend(x.strip().rstrip("/") for x in extra.split(",") if x.strip())
+    return sorted(set(origins))
 
 
 def _migrate_sqlite():
@@ -61,7 +75,7 @@ app = FastAPI(title="BOSS HR Assistant", version="0.1.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000", "https://www.zhipin.com"],
+    allow_origins=_cors_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -82,9 +96,12 @@ app.include_router(ext.router, prefix="/api/ext")
 def serve_userscript():
     if not os.path.isfile(USERSCRIPT_PATH):
         return Response("userscript not found", status_code=404)
+    with open(USERSCRIPT_PATH, "r", encoding="utf-8") as f:
+        script = f.read()
+    script = script.replace("__BOSS_HELPER_BASE_URL__", PUBLIC_BASE_URL)
     # no-cache so Tampermonkey's update check always sees the latest @version
-    return FileResponse(
-        USERSCRIPT_PATH,
+    return Response(
+        script,
         media_type="text/javascript; charset=utf-8",
         headers={"Cache-Control": "no-cache"},
     )
