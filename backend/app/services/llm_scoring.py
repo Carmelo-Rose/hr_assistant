@@ -22,12 +22,20 @@ import httpx
 logger = logging.getLogger(__name__)
 
 
+class LLMConfigError(ValueError):
+    pass
+
+
+def _clean_env(value: str) -> str:
+    return value.strip().strip("\"'")
+
+
 def _cfg():
     """每次读取环境变量,便于 .env 改动后无需重启即可生效(开发期)。"""
     return {
-        "base_url": os.environ.get("LLM_BASE_URL", "").rstrip("/"),
-        "api_key": os.environ.get("LLM_API_KEY", ""),
-        "model": os.environ.get("LLM_MODEL", ""),
+        "base_url": _clean_env(os.environ.get("LLM_BASE_URL", "")).rstrip("/"),
+        "api_key": _clean_env(os.environ.get("LLM_API_KEY", "")),
+        "model": _clean_env(os.environ.get("LLM_MODEL", "")),
         "timeout": float(os.environ.get("LLM_TIMEOUT", "60")),
         "batch": int(os.environ.get("LLM_BATCH_SIZE", "10")),
     }
@@ -42,6 +50,25 @@ def config_hint() -> str:
     c = _cfg()
     missing = [k.upper() for k in ("base_url", "api_key", "model") if not c[k]]
     return "缺少环境变量: " + ", ".join("LLM_" + m for m in missing)
+
+
+def _require_ascii_config(name: str, value: str) -> None:
+    try:
+        value.encode("ascii")
+    except UnicodeEncodeError as exc:
+        raise LLMConfigError(
+            f"{name} 包含非 ASCII 字符，请检查 backend/.env 只填写实际配置值，"
+            "不要把中文说明、占位文本或行内注释写进配置；修改后需要重启后端。"
+        ) from exc
+
+
+def _validate_config(c: dict) -> None:
+    for name, key in (
+        ("LLM_BASE_URL", "base_url"),
+        ("LLM_API_KEY", "api_key"),
+        ("LLM_MODEL", "model"),
+    ):
+        _require_ascii_config(name, c[key])
 
 
 def build_job_desc(job) -> str:
@@ -87,6 +114,7 @@ def _extract_json_array(text: str):
 def _call_chat(messages: list[dict]) -> str:
     """调用 OpenAI 兼容的 /chat/completions,返回 assistant 文本。"""
     c = _cfg()
+    _validate_config(c)
     url = f"{c['base_url']}/chat/completions"
     headers = {
         "Authorization": f"Bearer {c['api_key']}",
