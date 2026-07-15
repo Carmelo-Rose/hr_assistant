@@ -55,7 +55,7 @@ def get_today_queue(
     Build today's queue:
     - For each MatchResult that is NOT sent_manual/skipped, or if already queued
     - Order by: score desc, active_status bonus, completeness
-    - Dedup by candidate_id (pick best score first)
+    - Dedup by (candidate_id, job_id) so one candidate can appear once per job
     """
     query = (
         db.query(MatchResult)
@@ -104,16 +104,17 @@ def get_today_queue(
         .all()
     )
 
-    # Dedup by candidate_id (keep highest score)
+    # Dedup by candidate + job. Keep different job matches visible in the
+    # all-jobs queue instead of accidentally merging them.
     seen = {}
     items = []
     for row in results:
         (mr, name, active_status, boss_id, age, education, work_years,
          salary_range, job_status, expected_city, skills, job_title, outreach_id) = row
-        cid = mr.candidate_id
-        if cid in seen:
+        key = (mr.candidate_id, mr.job_id)
+        if key in seen:
             continue
-        seen[cid] = True
+        seen[key] = True
         items.append(QueueItem(
             match_id=mr.id,
             candidate_id=mr.candidate_id,

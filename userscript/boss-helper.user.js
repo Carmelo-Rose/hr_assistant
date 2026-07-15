@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BOSS 招聘助手 — 油猴版
 // @namespace    https://github.com/hr_assistant
-// @version      1.20.4
+// @version      1.20.17
 // @description  在 BOSS 直聘页面内扫描候选人、评分、队列复盘、辅助话术
 // @match        https://www.zhipin.com/*
 // @noframes
@@ -54,6 +54,7 @@
     mode: 'semi',      // legacy: 'semi' | 'auto'
     jobId: '',         // selected workbench job id (scoring profile)
     jobs: [],          // [{id, title}]
+    jobConfigMode: 'edit', // 'edit' | 'create'
     llmEnabled: false, // backend has LLM configured → personalize greetings
     threshold: 70,
     dailyCap: 150,
@@ -85,10 +86,46 @@
         headers: { 'Content-Type': 'application/json' },
         data: JSON.stringify(body),
         onload: (res) => {
+          if (res.status >= 400) {
+            let msg = `HTTP ${res.status}`;
+            try {
+              const j = JSON.parse(res.responseText);
+              if (j && j.detail) msg = typeof j.detail === 'string' ? j.detail : JSON.stringify(j.detail);
+              else if (j && j.error) msg = j.error;
+            } catch {}
+            reject(new Error(msg));
+            return;
+          }
           try { resolve(JSON.parse(res.responseText)); }
           catch { reject(new Error('Parse error: ' + res.responseText.slice(0, 200))); }
         },
         onerror: (err) => reject(new Error('Network error')),
+        ontimeout: () => reject(new Error('Timeout')),
+      });
+    });
+  }
+
+  function apiPatch(path, body) {
+    return new Promise((resolve, reject) => {
+      GM_xmlhttpRequest({
+        method: 'PATCH',
+        url: BACKEND + path,
+        headers: { 'Content-Type': 'application/json' },
+        data: JSON.stringify(body),
+        onload: (res) => {
+          if (res.status >= 400) {
+            let msg = `HTTP ${res.status}`;
+            try {
+              const j = JSON.parse(res.responseText);
+              if (j && j.detail) msg = typeof j.detail === 'string' ? j.detail : JSON.stringify(j.detail);
+            } catch {}
+            reject(new Error(msg));
+            return;
+          }
+          try { resolve(JSON.parse(res.responseText)); }
+          catch { reject(new Error('Parse error: ' + res.responseText.slice(0, 200))); }
+        },
+        onerror: () => reject(new Error('Network error')),
         ontimeout: () => reject(new Error('Timeout')),
       });
     });
@@ -188,6 +225,54 @@
   // (li.card-item) puts it on `.card-inner[data-geek]` instead. Try both.
   function getGeekIdEl(card) {
     return card.querySelector('a[data-contact]') || card.querySelector('[data-geek],[data-geekid]');
+  }
+
+  function getCardCandidateId(card) {
+    const idEl = getGeekIdEl(card);
+    return idEl
+      ? (idEl.getAttribute('data-expect') || idEl.getAttribute('data-geek') || idEl.getAttribute('data-geekid') || '')
+      : '';
+  }
+
+  function isVisibleElement(el) {
+    if (!el || !el.isConnected || !el.getClientRects().length) return false;
+    const style = el.ownerDocument.defaultView.getComputedStyle(el);
+    return style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0';
+  }
+
+  // The chat/recommend redesign uses a generic "沟通" label in the card
+  // action bar, while the older talent-search page uses "打招呼". Keep the
+  // generic label scoped to a card action bar or a resume/detail panel so the
+  // left navigation's "沟通" item can never be clicked by mistake.
+  function isGreetAction(el, scope) {
+    const text = (el?.textContent || '').trim();
+    if (!/^(打招呼|立即沟通|继续沟通|去沟通|沟通|联系Ta|联系TA)$/.test(text)) return false;
+    if (!isVisibleElement(el)) return false;
+    if (scope === 'card') {
+      return !!el.closest('.button-list, [class*="button-list"], [class*="action-list"]');
+    }
+    return !el.closest('.menu-item-content, .nav-item, .menu-item, [class*="sidebar"]');
+  }
+
+  function findCardGreetControl(cardEl) {
+    const controls = [...cardEl.querySelectorAll(
+      '.button-list button, .button-list a, .button-list .btn,' +
+      ' [class*="button-list"] button, [class*="button-list"] a, [class*="button-list"] .btn'
+    )].filter(isVisibleElement);
+    if (!controls.length) return null;
+
+    const textMatch = controls.find(el => isGreetAction(el, 'card'));
+    if (textMatch) return textMatch;
+
+    const semanticMatch = controls.find(el =>
+      /(greet|contact|commun|chat|getcontact|沟通|打招呼)/i.test(el.className || '')
+    );
+    if (semanticMatch) return semanticMatch;
+
+    // The current chat/recommend layout exposes exactly one generic `.btn`
+    // in each card's button-list and renders its label through an icon/text
+    // component, so there is no reliable text node to match.
+    return controls.length === 1 ? controls[0] : null;
   }
 
   // Structured extraction for the new li.card-item DOM: fields sit in dedicated
@@ -342,7 +427,8 @@
     const greet = [];
     allDocs.forEach(doc => {
       [...doc.querySelectorAll('button,a,span,div')]
-        .filter(e => !ourPanel?.contains(e) && e.children.length === 0 && greetRe.test((e.textContent || '').trim()))
+        .filter(e => !ourPanel?.contains(e) && greetRe.test((e.textContent || '').trim()) &&
+          (e.children.length === 0 || e.matches('button,a,[role="button"]')))
         .slice(0, 5)
         .forEach(b => {
           const p = b.parentElement;
@@ -394,6 +480,35 @@
       }
     }
 
+    // 5b) The redesigned chat/recommend cards keep their primary action in a
+    // `.button-list` after the main profile markup. Capture it separately:
+    // the general card sample is intentionally truncated before this region.
+    const cardActionSamples = [];
+    if (cardDoc) {
+      [...cardDoc.querySelectorAll(CARD_SEL)].slice(0, 3).forEach((card, index) => {
+        const actionBar = card.querySelector('.button-list, [class*="button-list"], [class*="action-list"]');
+        if (!actionBar) {
+          cardActionSamples.push({ card: index + 1, actionBar: null });
+          return;
+        }
+        const controls = [...actionBar.querySelectorAll('button, a, [role="button"], .btn, [class*="btn"]')]
+          .slice(0, 8)
+          .map(el => ({
+            tag: el.tagName.toLowerCase(),
+            class: el.getAttribute('class') || '',
+            text: (el.textContent || '').trim(),
+            visible: isVisibleElement(el),
+            html: (el.outerHTML || '').slice(0, 500),
+          }));
+        cardActionSamples.push({
+          card: index + 1,
+          actionBarClass: actionBar.getAttribute('class') || '',
+          actionBarHtml: (actionBar.outerHTML || '').slice(0, 1200),
+          controls,
+        });
+      });
+    }
+
     // 6) Full HTML dump for the most likely per-candidate card class (any class
     //    whose element count is close to the visible candidate count), so we can
     //    redesign the extractor when `li.geek-info-card` no longer matches.
@@ -424,7 +539,10 @@
       }
     }
 
+    let scriptVersion = '?';
+    try { scriptVersion = (GM_info && GM_info.script && GM_info.script.version) || '?'; } catch {}
     const report = {
+      scriptVersion,
       url: location.href,
       iframeCount: allDocs.length - 1,
       cardCandidates: repeating,
@@ -432,6 +550,7 @@
       greetButtons: greet.length ? greet : '（未找到"打招呼/沟通/联系Ta"按钮，可能要 hover 或进详情页才出现）',
       pagination: pagination.length ? pagination : '（未找到"下一页"控件）',
       scrollContainer,
+      cardActionSamples,
       sampleContainer: sampleSel,
       sampleDoc,
       sampleSkeleton: skeleton,
@@ -504,7 +623,7 @@
       // reveal the input (or to send) on this particular BOSS page layout.
       doc.querySelectorAll('button,a,span,div').forEach(el => {
         if (ourPanels.some(p => p && p.contains(el))) return;
-        if (el.children.length !== 0) return;
+        if (el.children.length !== 0 && !el.matches('button,a,[role="button"]')) return;
         if (!greetRe.test((el.textContent || '').trim())) return;
         if (el.offsetParent === null) return;
         greetBtns.push(`doc${di} | ${el.tagName.toLowerCase()} | text="${el.textContent.trim()}" | class="${el.getAttribute('class') || ''}" | parentClass="${el.parentElement ? (el.parentElement.getAttribute('class') || '') : ''}"`);
@@ -539,24 +658,20 @@
     return text;
   }
 
-  // Resolve a queue item's boss_id to a live card element on the current page.
-  // Tier 1: state.scanned cache (fast; re-check .isConnected since SPA
-  // re-renders can detach nodes between calls). Tier 2: full DOM scan —
-  // queue items may come from a prior scan session / a different page than
-  // what's currently rendered. Returns null if not found on this page now.
+  // Resolve a queue item's boss_id to a card that is live RIGHT NOW. BOSS's
+  // virtual list can reuse a connected DOM node for a different candidate, so
+  // a cached card reference is never trusted unless its current data-* ID also
+  // matches. Prefer a fresh DOM scan to avoid opening the wrong resume.
   function findCardByBossId(bossId) {
     if (!bossId) return null;
-    for (const it of state.scanned || []) {
-      if (it && it.expectId === bossId && it.cardEl && it.cardEl.isConnected) {
-        return it.cardEl;
-      }
-    }
     for (const doc of getAllDocs()) {
       for (const card of doc.querySelectorAll(CARD_SEL)) {
-        const idEl = getGeekIdEl(card);
-        if (!idEl) continue;
-        const id = idEl.getAttribute('data-expect') || idEl.getAttribute('data-geek') || idEl.getAttribute('data-geekid');
-        if (id === bossId) return card;
+        if (getCardCandidateId(card) === bossId) return card;
+      }
+    }
+    for (const it of state.scanned || []) {
+      if (it && it.expectId === bossId && it.cardEl && it.cardEl.isConnected && getCardCandidateId(it.cardEl) === bossId) {
+        return it.cardEl;
       }
     }
     return null;
@@ -782,14 +897,14 @@
   function clickGreetButtonAnywhere() {
     const ourPanels = [document.getElementById('boss-helper-panel'), document.getElementById('boss-helper-queue-panel')];
     for (const doc of getAllDocs()) {
-      for (const sel of ['button.btn-getcontact', 'button[class*="getcontact"]', 'a.btn-greet', 'a[class*="greet"]', 'button[class*="greet"]']) {
+      for (const sel of ['button.btn-greet', 'button.btn-getcontact', 'button[class*="getcontact"]', 'a.btn-greet', 'a[class*="greet"]', 'button[class*="greet"]']) {
         const btn = doc.querySelector(sel);
         if (btn && btn.offsetParent !== null && !ourPanels.some(p => p && p.contains(btn))) { btn.click(); return true; }
       }
       for (const el of doc.querySelectorAll('button,a,span,div')) {
-        if (el.children.length !== 0 || el.offsetParent === null) continue;
+        if (el.children.length !== 0) continue;
         if (ourPanels.some(p => p && p.contains(el))) continue;
-        if (/^打招呼$/.test((el.textContent || '').trim())) { el.click(); return true; }
+        if (isGreetAction(el)) { el.click(); return true; }
       }
     }
     return false;
@@ -800,15 +915,26 @@
   // click its greet button. Returns true if a greet action was triggered.
   async function triggerGreetUI(cardEl) {
     if (clickGreetBtn(cardEl)) return true;
-    openCardChat(cardEl);
-    await sleep(1500);
-    return clickGreetButtonAnywhere();
+    // The action bar can be hover-revealed in the virtualized card list.
+    cardEl.dispatchEvent(new MouseEvent('mouseover', { bubbles: true, view: cardEl.ownerDocument.defaultView }));
+    cardEl.dispatchEvent(new MouseEvent('mouseenter', { bubbles: false, view: cardEl.ownerDocument.defaultView }));
+    await sleep(200);
+    if (clickGreetBtn(cardEl)) return true;
+    if (!openCardChat(cardEl)) return false;
+    // The resume panel is rendered asynchronously, often inside a nested
+    // same-origin iframe. Poll rather than taking a single timing snapshot.
+    for (let attempt = 0; attempt < 12; attempt++) {
+      await sleep(500);
+      if (clickGreetButtonAnywhere()) return true;
+    }
+    return false;
   }
 
   // ─── Click "打招呼" button on a card ──────────────────────────────
   function clickGreetBtn(cardEl) {
     // Try common BOSS greet button selectors
     const greetBtnSelectors = [
+      'button.btn-greet',              // chat/recommend card action (2026-07)
       'button.btn-getcontact',         // 人才库搜索页"联系Ta"按钮（当前 BOSS DOM）
       'button[class*="getcontact"]',
       'a.btn-greet',                   // 推荐/搜索页卡片上的招呼按钮
@@ -818,15 +944,20 @@
     ];
     for (const sel of greetBtnSelectors) {
       const btn = cardEl.querySelector(sel);
-      if (btn) {
+      if (btn && isVisibleElement(btn)) {
         btn.click();
         return true;
       }
     }
-    // Fallback: find "沟通" / "打招呼" / "联系Ta" text node inside card (new BOSS DOM)
-    const greetRe = /^(打招呼|立即沟通|继续沟通|去沟通|沟通|联系Ta|联系TA)$/;
+    const actionControl = findCardGreetControl(cardEl);
+    if (actionControl) {
+      actionControl.click();
+      return true;
+    }
+    // New chat/recommend cards put the action in `.button-list` and may use
+    // the generic "沟通" label instead of exposing a stable class name.
     for (const el of cardEl.querySelectorAll('button,a,span,div')) {
-      if (el.children.length === 0 && greetRe.test((el.textContent || '').trim())) {
+      if (el.children.length === 0 && isGreetAction(el, 'card')) {
         el.click();
         return true;
       }
@@ -853,20 +984,20 @@
   GM_addStyle(`
     #boss-helper-panel {
       position: fixed; top: 200px; right: 20px; z-index: 99999;
-      width: 340px; background: #fff; border-radius: 12px;
-      box-shadow: 0 4px 24px rgba(0,0,0,.18); font-family: -apple-system, sans-serif;
-      font-size: 13px; color: #333; user-select: none;
+      width: 352px; background: #fff; border: 1px solid #e7eaff; border-radius: 14px;
+      box-shadow: 0 12px 36px rgba(35, 55, 130, .18); font-family: -apple-system, sans-serif;
+      font-size: 13px; color: #24304f; user-select: none;
     }
     #boss-helper-panel.dragging { cursor: move; }
     .bh-header {
       display: flex; align-items: center; justify-content: space-between;
-      padding: 10px 14px; background: #4f6ef7; color: #fff;
-      border-radius: 12px 12px 0 0; cursor: move;
+      padding: 11px 14px; background: linear-gradient(135deg, #536dfe, #4355cc); color: #fff;
+      border-radius: 13px 13px 0 0; cursor: move;
     }
     .bh-header h3 { margin: 0; font-size: 14px; font-weight: 600; cursor: pointer; display: flex; align-items: center; gap: 6px; }
     .bh-collapse-arrow { display: inline-block; transition: transform 0.15s; font-size: 10px; }
     .bh-header .bh-close { cursor: pointer; font-size: 18px; line-height: 1; }
-    .bh-body { padding: 12px 14px; }
+    .bh-body { padding: 10px 14px 12px; }
     #boss-helper-panel.bh-collapsed .bh-body { display: none; }
     #boss-helper-panel.bh-collapsed .bh-collapse-arrow { transform: rotate(-90deg); }
     #boss-helper-panel.bh-collapsed .bh-header { border-radius: 12px; }
@@ -875,16 +1006,50 @@
     .bh-row input[type=number] { width: 60px; padding: 4px 6px; border: 1px solid #ddd; border-radius: 6px; }
     .bh-row input[type=range] { width: 120px; }
     .bh-row select { padding: 4px 6px; border: 1px solid #ddd; border-radius: 6px; }
+    .bh-icon-btn {
+      width: 30px; height: 28px; display: inline-flex; align-items: center; justify-content: center;
+      border: 1px solid #ddd; border-radius: 7px; background: #fff; color: #555; cursor: pointer;
+      font-size: 13px;
+    }
+    .bh-icon-btn:hover { border-color: #4f6ef7; color: #4f6ef7; }
+    .bh-job-config {
+      display: none; margin: 8px 0 10px; padding: 10px; border: 1px solid #e6e8ef;
+      border-radius: 8px; background: #fafbff; user-select: text;
+    }
+    .bh-job-config.open { display: block; }
+    .bh-job-config-head { display: flex; gap: 6px; margin-bottom: 9px; }
+    .bh-job-mode-btn {
+      flex: 1; padding: 5px 8px; border: 1px solid #d9dce6; border-radius: 7px;
+      background: #fff; color: #555; font-size: 12px; cursor: pointer;
+    }
+    .bh-job-mode-btn.active { border-color: #4f6ef7; background: #eef2ff; color: #3455dc; font-weight: 600; }
+    .bh-job-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+    .bh-job-field.full { grid-column: 1 / -1; }
+    .bh-job-field label { display: block; margin-bottom: 3px; font-size: 11px; color: #666; }
+    .bh-job-field input,
+    .bh-job-field select {
+      width: 100%; box-sizing: border-box; padding: 5px 7px; border: 1px solid #d9dce6;
+      border-radius: 6px; background: #fff; font-size: 12px;
+    }
+    .bh-job-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 10px; }
+    .bh-job-hint { margin-top: 7px; font-size: 11px; color: #888; line-height: 1.4; }
     .bh-btn {
-      display: inline-block; padding: 6px 14px; border-radius: 8px;
-      font-size: 12px; cursor: pointer; border: none; font-weight: 500;
+      display: inline-block; padding: 7px 13px; border-radius: 8px;
+      font-size: 12px; cursor: pointer; border: none; font-weight: 600;
     }
     .bh-btn-primary { background: #4f6ef7; color: #fff; }
     .bh-btn-danger { background: #e74c3c; color: #fff; }
     .bh-btn-secondary { background: #f0f0f0; color: #333; }
-    .bh-stats { font-size: 12px; color: #888; margin-bottom: 10px; }
-    .bh-stats b { color: #4f6ef7; }
-    .bh-status { margin-top: 8px; font-size: 11px; color: #999; }
+    .bh-stats { display: flex; align-items: center; justify-content: space-between; font-size: 12px; color: #66708b; margin-bottom: 9px; }
+    .bh-stats b { color: #4355cc; }
+    .bh-section { padding: 0; margin-bottom: 8px; border: 0; border-radius: 0; background: transparent; }
+    .bh-section-title { display: none; }
+    .bh-section .bh-row:last-child { margin-bottom: 0; }
+    .bh-action-row { display: flex; align-items: center; gap: 8px; margin-top: 3px; }
+    #bh-scan { flex: 1.25; }
+    #bh-open-queue { flex: 1; }
+    #bh-diag { padding: 7px 4px; background: transparent; color: #7b849b; }
+    .bh-status { min-height: 14px; margin-top: 8px; font-size: 11px; color: #7b849b; }
     .bh-status.err { color: #e74c3c; }
     .bh-badge {
       position: absolute; top: 6px; right: 40px;
@@ -905,19 +1070,19 @@
     /* ─── Queue panel ─────────────────────────────────────────────── */
     #boss-helper-queue-panel {
       position: fixed; top: 200px; right: 372px; z-index: 99998;
-      width: 780px; max-height: 82vh;
+      width: min(780px, calc(100vw - 64px)); max-height: 82vh;
       display: none; flex-direction: column;
-      background: #fff; border-radius: 12px;
-      box-shadow: 0 6px 32px rgba(0,0,0,.20);
-      font-family: -apple-system, sans-serif; font-size: 13px; color: #333;
+      background: #fff; border: 1px solid #e7eaff; border-radius: 14px;
+      box-shadow: 0 14px 40px rgba(35, 55, 130, .20);
+      font-family: -apple-system, sans-serif; font-size: 13px; color: #24304f;
     }
     #boss-helper-queue-panel.bhq-stacked {
       right: 20px; width: 340px;
     }
     .bhq-header {
       display: flex; align-items: center; gap: 8px;
-      padding: 10px 14px; background: #4f6ef7; color: #fff;
-      border-radius: 12px 12px 0 0; cursor: move; user-select: none;
+      padding: 11px 14px; background: linear-gradient(135deg, #536dfe, #4355cc); color: #fff;
+      border-radius: 13px 13px 0 0; cursor: move; user-select: none;
     }
     .bhq-header h3 { margin: 0; font-size: 14px; font-weight: 600; flex: 0 0 auto; }
     .bhq-tabs { display: flex; gap: 4px; margin-left: 10px; }
@@ -936,27 +1101,39 @@
 
     .bhq-toolbar {
       display: flex; align-items: center; gap: 8px;
-      padding: 8px 14px; border-bottom: 1px solid #eee;
-      background: #fafbfc;
+      padding: 9px 14px; border-bottom: 1px solid #edf0f7;
+      background: #fafbff; flex-wrap: wrap;
     }
-    .bhq-toolbar-status { flex: 1; font-size: 11px; color: #888; }
+    .bhq-toolbar-status { display: none; }
     .bhq-toolbar-status.err { color: #e74c3c; }
+    .bhq-filter { display: flex; align-items: center; gap: 4px; font-size: 11px; color: #666; white-space: nowrap; }
+    .bhq-filter select {
+      max-width: 160px; padding: 3px 22px 3px 6px; border: 1px solid #d9def5;
+      border-radius: 6px; background: #fff; color: #35469d; font-size: 11px;
+    }
+    #bhq-bulk-skip { margin-left: auto; }
 
     .bhq-list {
-      flex: 1; overflow-y: auto; padding: 6px 8px 12px;
-      min-height: 120px;
+      flex: 1; overflow-y: auto; padding: 10px;
+      min-height: 120px; background: #f7f8fd;
     }
-    .bhq-empty { padding: 40px 20px; text-align: center; color: #aaa; font-size: 12px; }
+    .bhq-empty { padding: 40px 20px; text-align: center; color: #8a93a9; font-size: 12px; }
     .bhq-row {
       display: flex; gap: 10px; align-items: flex-start;
-      padding: 10px 10px; border-bottom: 1px solid #f0f0f0;
-      cursor: pointer; transition: background 0.12s;
+      padding: 11px 12px; margin-bottom: 8px; border: 1px solid #e9ecf5; border-radius: 10px;
+      background: #fff; cursor: pointer; transition: background .12s, border-color .12s, box-shadow .12s;
     }
-    .bhq-row:hover { background: #f7f9ff; }
+    .bhq-row:hover { border-color: #cfd7ff; background: #fff; box-shadow: 0 4px 12px rgba(63, 79, 160, .08); }
     .bhq-row-main { flex: 1; min-width: 0; }
     .bhq-row-actions { flex: 0 0 auto; display: flex; gap: 4px; align-items: center; }
     .bhq-name-line { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
-    .bhq-name { font-size: 13px; font-weight: 600; color: #222; }
+    .bhq-name { font-size: 13px; font-weight: 700; color: #24304f; }
+    .bhq-job {
+      display: inline-block; max-width: 220px; overflow: hidden;
+      text-overflow: ellipsis; white-space: nowrap; padding: 1px 7px;
+      border-radius: 10px; background: #eef2ff; color: #4355b9;
+      font-size: 11px; line-height: 1.4;
+    }
     .bhq-badge {
       display: inline-block; padding: 1px 7px; border-radius: 10px;
       font-size: 11px; font-weight: 600; line-height: 1.4;
@@ -977,23 +1154,17 @@
     .bhq-status-dot.filled { background: #ffc107; }
     .bhq-status-dot.sent_manual { background: #28a745; }
     .bhq-status-dot.skipped { background: #dc3545; }
-    .bhq-active { font-size: 11px; color: #999; }
     .bhq-info {
       font-size: 11px; color: #666; margin-top: 3px;
       overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
     }
-    .bhq-reason {
-      font-size: 11px; color: #555; margin-top: 3px;
-      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-    }
-    .bhq-reason.ai { color: #4b3fbb; }
     .bhq-missing {
       font-size: 11px; color: #b26a00; margin-top: 3px;
       overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
     }
     .bhq-act {
-      padding: 3px 9px; border-radius: 6px; border: none;
-      font-size: 11px; cursor: pointer; font-weight: 500;
+      padding: 5px 9px; border-radius: 7px; border: none;
+      font-size: 11px; cursor: pointer; font-weight: 600;
     }
     .bhq-act-primary { background: #4f6ef7; color: #fff; }
     .bhq-act-success { background: #28a745; color: #fff; }
@@ -1003,15 +1174,15 @@
 
     .bhq-progress-wrap {
       display: flex; align-items: center; gap: 10px;
-      padding: 8px 14px; border-bottom: 1px solid #eee;
-      background: #fafbfc;
+      padding: 10px 14px; border-bottom: 1px solid #e4e8fb;
+      background: #f7f8ff;
     }
     .bhq-progress-bar {
-      flex: 1; height: 6px; border-radius: 3px; background: #e6e9f0; overflow: hidden;
+      flex: 1; height: 7px; border-radius: 999px; background: #e3e7f6; overflow: hidden;
     }
     .bhq-progress-fill {
-      height: 100%; width: 0%; background: #4f6ef7; border-radius: 3px;
-      transition: width 0.25s ease;
+      height: 100%; width: 0%; background: linear-gradient(90deg, #536dfe, #7c4dff); border-radius: 999px;
+      transition: width 0.7s cubic-bezier(.22, 1, .36, 1);
     }
     .bhq-progress-text { flex: 0 0 auto; font-size: 11px; color: #666; white-space: nowrap; }
 
@@ -1045,26 +1216,32 @@
         <span class="bh-close">×</span>
       </div>
       <div class="bh-body">
-        <div class="bh-stats">
-          今日已打招呼 <b id="bh-count">${state.greetingCount}</b> / <b id="bh-cap">${state.dailyCap}</b>
+        <div class="bh-stats"><span>今日触达</span><span><b id="bh-count">${state.greetingCount}</b> / <b id="bh-cap">${state.dailyCap}</b></span></div>
+        <div class="bh-section">
+          <p class="bh-section-title">评分设置</p>
+          <div class="bh-row">
+            <label>匹配岗位</label>
+            <select id="bh-job" style="flex:1"><option value="">加载中…</option></select>
+            <button class="bh-icon-btn" id="bh-job-config-toggle" title="配置当前岗位">⚙</button>
+          </div>
+          <div class="bh-row">
+            <label>评分阈值</label>
+            <input type="range" id="bh-threshold" min="0" max="100" value="${state.threshold}">
+            <span id="bh-threshold-val">${state.threshold}</span>
+          </div>
         </div>
-        <div class="bh-row">
-          <label>匹配岗位</label>
-          <select id="bh-job" style="flex:1"><option value="">加载中…</option></select>
+        <div class="bh-job-config" id="bh-job-config"></div>
+        <div class="bh-section">
+          <p class="bh-section-title">扫描范围</p>
+          <div class="bh-row">
+            <label>自动加载</label>
+            <input type="checkbox" id="bh-multipage" ${state.multiPage ? 'checked' : ''}>
+            <span style="font-size:11px;color:#7b849b">加载上限</span>
+            <input type="number" id="bh-maxcand" value="${state.maxCandidates}" min="15" max="500" step="5" style="width:56px">
+            <span style="font-size:11px;color:#7b849b">人</span>
+          </div>
         </div>
-        <div class="bh-row">
-          <label>评分阈值</label>
-          <input type="range" id="bh-threshold" min="0" max="100" value="${state.threshold}">
-          <span id="bh-threshold-val">${state.threshold}</span>
-        </div>
-        <div class="bh-row">
-          <label>自动加载</label>
-          <input type="checkbox" id="bh-multipage" ${state.multiPage ? 'checked' : ''}>
-          <span style="font-size:11px;color:#999">加载上限</span>
-          <input type="number" id="bh-maxcand" value="${state.maxCandidates}" min="15" max="500" step="5" style="width:56px">
-          <span style="font-size:11px;color:#999">人</span>
-        </div>
-        <div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap;">
+        <div class="bh-action-row">
           <button class="bh-btn bh-btn-primary" id="bh-scan">扫描列表</button>
           <button class="bh-btn bh-btn-secondary" id="bh-open-queue">查看队列</button>
           <button class="bh-btn bh-btn-secondary" id="bh-diag">诊断</button>
@@ -1107,6 +1284,14 @@
     // Controls
     document.getElementById('bh-job').addEventListener('change', (e) => {
       state.jobId = e.target.value;
+      state.jobConfigMode = 'edit';
+      renderJobConfig();
+    });
+    document.getElementById('bh-job-config-toggle').addEventListener('click', () => {
+      const box = document.getElementById('bh-job-config');
+      if (!box) return;
+      box.classList.toggle('open');
+      renderJobConfig();
     });
 
     const thresholdEl = document.getElementById('bh-threshold');
@@ -1199,7 +1384,23 @@
   }
 
   async function doScan() {
-    setStatus('正在扫描卡片...');
+    const job = selectedJob();
+    if (job) {
+      try {
+        setStatus('正在同步 BOSS 跳槽频率筛选...');
+        const label = await syncNativeTurnoverFrequency(job);
+        setStatus(`BOSS 跳槽频率已设为：${label}，正在扫描卡片...`);
+      } catch (err) {
+        // Native BOSS filters differ between recommend/search page versions.
+        // Failing to mirror this optional filter must not block local card
+        // extraction and scoring; continue with the list currently displayed.
+        const message = `BOSS 跳槽频率未同步：${err.message || err}，继续扫描当前列表`;
+        setStatus(message);
+        showToast(message, true);
+      }
+    } else {
+      setStatus('正在扫描卡片...');
+    }
     bindBadgeListeners();  // iframe may have loaded after init
     // Remove old badges (cards live in an iframe, so clear every document)
     getAllDocs().forEach(doc => doc.querySelectorAll('.bh-card-score').forEach(b => b.remove()));
@@ -1418,25 +1619,360 @@
     }
   }
 
+  function selectedJob() {
+    return state.jobs.find(j => String(j.id) === String(state.jobId)) || null;
+  }
+
+  function activeRequirementLabel(value) {
+    return ({
+      any: '不限',
+      today: '今日活跃',
+      '3d': '3日内活跃',
+      week: '本周活跃',
+    })[value || 'any'] || '不限';
+  }
+
+  function turnoverFrequencyLabel(value) {
+    return ({
+      any: '不限',
+      fewer_than_3_in_5y: '5年少于3份',
+      average_job_over_1y: '平均每份工作大于1年',
+    })[value || 'any'] || '不限';
+  }
+
+  function normalizedNativeText(value) {
+    return String(value || '').replace(/\s+/g, '').replace(/[（(].*?[）)]/g, '');
+  }
+
+  function findVisibleExactText(text, root) {
+    const expected = normalizedNativeText(text);
+    const docs = root ? [root] : getAllDocs();
+    for (const doc of docs) {
+      const matches = Array.from(doc.querySelectorAll('button, [role="button"], div, span, label, li, a'))
+        .filter(el => isVisibleElement(el) && normalizedNativeText(el.textContent) === expected);
+      if (matches.length) return matches.sort((a, b) => a.children.length - b.children.length)[0];
+    }
+    return null;
+  }
+
+  function findTurnoverFrequencyOption(value) {
+    const label = turnoverFrequencyLabel(value);
+    if (value !== 'any') return findVisibleExactText(label);
+
+    // “不限” appears in several BOSS filter groups, so scope it to the
+    // turnover-frequency group instead of clicking a similarly named option.
+    for (const doc of getAllDocs()) {
+      const header = Array.from(doc.querySelectorAll('div, span, label, p'))
+        .filter(el => isVisibleElement(el) && /跳槽频率/.test(normalizedNativeText(el.textContent)))
+        .sort((a, b) => normalizedNativeText(a.textContent).length - normalizedNativeText(b.textContent).length)[0];
+      const group = header?.parentElement;
+      const option = group && Array.from(group.querySelectorAll('button, [role="button"], div, span, label, li, a'))
+        .find(el => isVisibleElement(el) && normalizedNativeText(el.textContent) === label);
+      if (option) return option;
+    }
+    return null;
+  }
+
+  function isNativeOptionSelected(el) {
+    for (let node = el; node && node.nodeType === 1; node = node.parentElement) {
+      const cls = String(node.className || '').toLowerCase();
+      if (node.getAttribute('aria-checked') === 'true' || node.getAttribute('aria-selected') === 'true') return true;
+      if (/(^|[-_\s])(active|selected|checked|current|is-select|is-active)([-_\s]|$)/.test(cls)) return true;
+    }
+    return false;
+  }
+
+  async function syncNativeTurnoverFrequency(job) {
+    const value = job?.turnover_frequency || 'any';
+    // "不限" imposes no extra constraint, so there is nothing to synchronize.
+    // Trying to locate its generic BOSS option is both unnecessary and
+    // unreliable because several filter groups contain an identically named
+    // "不限" choice on the chat/recommend page.
+    if (value === 'any') return turnoverFrequencyLabel(value);
+    let option = findTurnoverFrequencyOption(value);
+    if (!option) {
+      const trigger = findVisibleExactText('筛选');
+      if (!trigger) throw new Error('未找到 BOSS 的“筛选”入口');
+      trigger.click();
+      await sleep(180);
+      option = findTurnoverFrequencyOption(value);
+    }
+    if (!option) throw new Error(`未找到 BOSS 跳槽频率选项：${turnoverFrequencyLabel(value)}`);
+
+    if (!isNativeOptionSelected(option)) {
+      option.click();
+      await sleep(120);
+    }
+    const confirm = findVisibleExactText('确定');
+    if (confirm) {
+      confirm.click();
+      await sleep(800);
+    }
+    return turnoverFrequencyLabel(value);
+  }
+
+  function jobNumber(job, field, fallback) {
+    const n = Number(job && job[field]);
+    return Number.isFinite(n) && n > 0 ? n : fallback;
+  }
+
+  function blankJobConfig() {
+    return {
+      id: '',
+      title: '',
+      age_min: 24,
+      age_max: 38,
+      salary_min_k: 0,
+      salary_max_k: 0,
+      min_experience_years: 3,
+      active_requirement: '3d',
+      turnover_frequency: 'any',
+      experience_keywords: '',
+      capability_keywords: '',
+    };
+  }
+
+  function hasFullJobFields(job) {
+    return job && (
+      Object.prototype.hasOwnProperty.call(job, 'experience_keywords') ||
+      Object.prototype.hasOwnProperty.call(job, 'capability_keywords') ||
+      Object.prototype.hasOwnProperty.call(job, 'salary_min_k') ||
+      Object.prototype.hasOwnProperty.call(job, 'active_requirement') ||
+      Object.prototype.hasOwnProperty.call(job, 'turnover_frequency')
+    );
+  }
+
+  function normalizeJob(job) {
+    const hasActive = Object.prototype.hasOwnProperty.call(job || {}, 'active_requirement');
+    const hasTurnoverFrequency = Object.prototype.hasOwnProperty.call(job || {}, 'turnover_frequency');
+    return {
+      ...job,
+      age_min: jobNumber(job, 'age_min', 24),
+      age_max: jobNumber(job, 'age_max', 38),
+      salary_min_k: jobNumber(job, 'salary_min_k', 0),
+      salary_max_k: jobNumber(job, 'salary_max_k', 0),
+      min_experience_years: jobNumber(job, 'min_experience_years', 3),
+      active_requirement: hasActive ? (job.active_requirement || 'any') : '3d',
+      turnover_frequency: hasTurnoverFrequency ? (job.turnover_frequency || 'any') : 'any',
+      experience_keywords: job?.experience_keywords || '',
+      capability_keywords: job?.capability_keywords || '',
+    };
+  }
+
+  function renderJobConfig() {
+    const box = document.getElementById('bh-job-config');
+    if (!box || !box.classList.contains('open')) return;
+    const isCreate = state.jobConfigMode === 'create';
+    const current = selectedJob();
+    const job = isCreate ? blankJobConfig() : (current ? normalizeJob(current) : null);
+    if (!job) {
+      box.innerHTML = '<div class="bh-job-hint">请先选择岗位。</div>';
+      return;
+    }
+
+    const active = job.active_requirement || 'any';
+    const turnoverFrequency = job.turnover_frequency || 'any';
+    box.innerHTML = `
+      <div class="bh-job-config-head">
+        <button class="bh-job-mode-btn ${isCreate ? '' : 'active'}" id="bh-job-mode-edit">编辑当前</button>
+        <button class="bh-job-mode-btn ${isCreate ? 'active' : ''}" id="bh-job-mode-create">新增岗位</button>
+      </div>
+      <div class="bh-job-grid">
+        <div class="bh-job-field full">
+          <label>岗位名称</label>
+          <input id="bh-job-title" placeholder="例如：电商运营" value="${esc(job.title || '')}">
+        </div>
+        <div class="bh-job-field">
+          <label>年龄下限</label>
+          <input id="bh-job-age-min" type="number" min="0" max="80" value="${jobNumber(job, 'age_min', 24)}">
+        </div>
+        <div class="bh-job-field">
+          <label>年龄上限</label>
+          <input id="bh-job-age-max" type="number" min="0" max="80" value="${jobNumber(job, 'age_max', 38)}">
+        </div>
+        <div class="bh-job-field">
+          <label>最低薪资（K/月）</label>
+          <input id="bh-job-salary-min" type="number" min="0" max="999" value="${jobNumber(job, 'salary_min_k', 0)}">
+        </div>
+        <div class="bh-job-field">
+          <label>最高薪资（K/月）</label>
+          <input id="bh-job-salary-max" type="number" min="0" max="999" value="${jobNumber(job, 'salary_max_k', 0)}">
+        </div>
+        <div class="bh-job-field">
+          <label>最低经验年限</label>
+          <input id="bh-job-exp-min" type="number" min="0" max="30" value="${jobNumber(job, 'min_experience_years', 3)}">
+        </div>
+        <div class="bh-job-field">
+          <label>活跃要求</label>
+          <select id="bh-job-active">
+            ${['any', 'today', '3d', 'week'].map(v => `<option value="${v}" ${active === v ? 'selected' : ''}>${activeRequirementLabel(v)}</option>`).join('')}
+          </select>
+        </div>
+        <div class="bh-job-field full">
+          <label>跳槽频率（BOSS 原生单选）</label>
+          <select id="bh-job-turnover-frequency">
+            ${['any', 'fewer_than_3_in_5y', 'average_job_over_1y'].map(v => `<option value="${v}" ${turnoverFrequency === v ? 'selected' : ''}>${turnoverFrequencyLabel(v)}</option>`).join('')}
+          </select>
+        </div>
+        <div class="bh-job-field full">
+          <label>经验关键词（逗号分隔）</label>
+          <input id="bh-job-exp-kws" placeholder="例如：天猫,抖音,电商运营,品牌,操盘,3年" value="${esc(job.experience_keywords || '')}">
+        </div>
+        <div class="bh-job-field full">
+          <label>能力关键词（逗号分隔）</label>
+          <input id="bh-job-cap-kws" placeholder="例如：团队管理,渠道策略,全渠道,从0到1,项目管理" value="${esc(job.capability_keywords || '')}">
+        </div>
+      </div>
+      <div class="bh-job-actions">
+        <button class="bh-btn bh-btn-secondary" id="bh-job-cancel">收起</button>
+        <button class="bh-btn bh-btn-primary" id="bh-job-save">${isCreate ? '创建岗位' : '保存'}</button>
+      </div>
+      <div class="bh-job-hint">${isCreate ? '创建后会自动选中新岗位。' : '保存后点击“扫描列表”重新评分；活跃要求会作为硬筛选。'}</div>
+    `;
+    box.querySelector('#bh-job-mode-edit')?.addEventListener('click', () => {
+      state.jobConfigMode = 'edit';
+      renderJobConfig();
+    });
+    box.querySelector('#bh-job-mode-create')?.addEventListener('click', () => {
+      state.jobConfigMode = 'create';
+      renderJobConfig();
+    });
+    box.querySelector('#bh-job-cancel')?.addEventListener('click', () => box.classList.remove('open'));
+    box.querySelector('#bh-job-save')?.addEventListener('click', saveJobConfig);
+  }
+
+  function intField(id, fallback) {
+    const raw = document.getElementById(id)?.value;
+    const n = parseInt(raw, 10);
+    return Number.isFinite(n) ? n : fallback;
+  }
+
+  function sameJobConfig(saved, payload) {
+    if (!saved || !saved.id) return false;
+    const numEq = (field) => Number(saved[field]) === Number(payload[field]);
+    const strEq = (field) => String(saved[field] || '') === String(payload[field] || '');
+    return (
+      strEq('title') &&
+      numEq('age_min') &&
+      numEq('age_max') &&
+      numEq('salary_min_k') &&
+      numEq('salary_max_k') &&
+      numEq('min_experience_years') &&
+      strEq('active_requirement') &&
+      strEq('turnover_frequency') &&
+      strEq('experience_keywords') &&
+      strEq('capability_keywords')
+    );
+  }
+
+  async function readBackSavedJob(jobId) {
+    const jobs = await apiGet('/jobs');
+    return (jobs || []).find(j => String(j.id) === String(jobId)) || null;
+  }
+
+  async function saveJobConfig() {
+    const isCreate = state.jobConfigMode === 'create';
+    const job = isCreate ? blankJobConfig() : selectedJob();
+    if (!job) return;
+    const saveBtn = document.getElementById('bh-job-save');
+    const title = document.getElementById('bh-job-title')?.value?.trim() || '';
+    const payload = {
+      title: isCreate ? title : (title || job.title),
+      age_min: Math.max(0, Math.min(80, intField('bh-job-age-min', 24))),
+      age_max: Math.max(0, Math.min(80, intField('bh-job-age-max', 38))),
+      salary_min_k: Math.max(0, Math.min(999, intField('bh-job-salary-min', 0))),
+      salary_max_k: Math.max(0, Math.min(999, intField('bh-job-salary-max', 0))),
+      min_experience_years: Math.max(0, Math.min(30, intField('bh-job-exp-min', 3))),
+      active_requirement: document.getElementById('bh-job-active')?.value || 'any',
+      turnover_frequency: document.getElementById('bh-job-turnover-frequency')?.value || 'any',
+      experience_keywords: document.getElementById('bh-job-exp-kws')?.value?.trim() || '',
+      capability_keywords: document.getElementById('bh-job-cap-kws')?.value?.trim() || '',
+    };
+    if (payload.age_min && payload.age_max && payload.age_min > payload.age_max) {
+      setStatus('年龄下限不能大于上限', true);
+      showToast('年龄下限不能大于上限', true);
+      return;
+    }
+    if (payload.salary_min_k && payload.salary_max_k && payload.salary_min_k > payload.salary_max_k) {
+      setStatus('最低薪资不能大于最高薪资', true);
+      showToast('最低薪资不能大于最高薪资', true);
+      return;
+    }
+    if (!payload.title) {
+      setStatus('请先填写岗位名称', true);
+      showToast('请先填写岗位名称', true);
+      return;
+    }
+    setStatus(isCreate ? '正在创建岗位…' : '正在保存岗位配置…');
+    if (saveBtn) {
+      saveBtn.disabled = true;
+      saveBtn.textContent = isCreate ? '创建中…' : '保存中…';
+    }
+    try {
+      const saved = isCreate
+        ? await apiPost('/jobs', payload)
+        : await apiPatch('/jobs/' + encodeURIComponent(job.id), payload);
+      let verified = sameJobConfig(saved, payload) ? saved : await readBackSavedJob(saved && saved.id);
+      if (!sameJobConfig(verified, payload)) {
+        throw new Error('后端未保存完整岗位字段，请重启后端并重新安装/刷新脚本后再试');
+      }
+      verified = normalizeJob(verified);
+      state.jobs = isCreate
+        ? [...state.jobs.filter(j => j.id !== verified.id), verified]
+        : state.jobs.map(j => j.id === verified.id ? { ...j, ...verified } : j);
+      state.jobId = verified.id;
+      state.jobConfigMode = 'edit';
+      await loadJobs({ preserveSelection: true });
+      const box = document.getElementById('bh-job-config');
+      if (box) box.classList.add('open');
+      renderJobConfig();
+      const msg = isCreate ? `岗位已创建并选中：${verified.title}` : '岗位配置已保存，请重新扫描列表生效';
+      setStatus(msg);
+      showToast(msg);
+    } catch (err) {
+      const msg = `${isCreate ? '创建' : '保存'}失败：${err.message || err}`;
+      setStatus(msg, true);
+      showToast(msg, true);
+    } finally {
+      if (saveBtn) {
+        saveBtn.disabled = false;
+        saveBtn.textContent = isCreate ? '创建岗位' : '保存';
+      }
+    }
+  }
+
   // ─── Load workbench jobs into the picker ──────────────────────────
-  async function loadJobs() {
+  async function loadJobs(opts = {}) {
     const sel = document.getElementById('bh-job');
     try {
-      const jobs = await apiGet('/jobs');
-      state.jobs = jobs || [];
+      let jobs = await apiGet('/jobs');
+      if ((jobs || []).length && !hasFullJobFields(jobs[0])) {
+        try {
+          jobs = await apiGetRoot('/jobs');
+        } catch {
+          // Older /api/ext/jobs only had id/title; keep it usable, with defaults.
+        }
+      }
+      const previous = opts.preserveSelection ? state.jobId : '';
+      state.jobs = (jobs || []).map(normalizeJob);
       if (!state.jobs.length) {
         if (sel) sel.innerHTML = '<option value="">（无岗位，请在工作台配置）</option>';
+        renderQueueJobFilter();
+        renderJobConfig();
         return;
       }
-      state.jobId = state.jobs[0].id; // default to first job
+      state.jobId = previous && state.jobs.some(j => j.id === previous) ? previous : state.jobs[0].id;
       if (sel) {
         sel.innerHTML = state.jobs
-          .map(j => `<option value="${j.id}">${j.title}</option>`)
+          .map(j => `<option value="${esc(j.id)}">${esc(j.title)}</option>`)
           .join('');
         sel.value = state.jobId;
       }
+      renderQueueJobFilter();
+      renderJobConfig();
     } catch {
       if (sel) sel.innerHTML = '<option value="">（加载岗位失败）</option>';
+      renderJobConfig();
     }
   }
 
@@ -1453,18 +1989,10 @@
     } catch { return; }
     if (!res || !res.boss_id) return;
 
-    for (const doc of getAllDocs()) {
-      for (const card of doc.querySelectorAll(CARD_SEL)) {
-        const idEl = getGeekIdEl(card);
-        if (!idEl) continue;
-        const id = idEl.getAttribute('data-expect') || idEl.getAttribute('data-geek') || idEl.getAttribute('data-geekid');
-        if (id === res.boss_id) {
-          openCardChat(card);
-          window.focus();
-          setStatus(`已跳转到 ${res.name || '候选人'}`);
-          return;
-        }
-      }
+    if (findCardByBossId(res.boss_id)) {
+      await locateCardOnPage({ boss_id: res.boss_id, name: res.name || '' });
+      window.focus();
+      return;
     }
     setStatus(`未找到 ${res.name || '该候选人'} 的卡片(可能已翻页/不在本页)`, true);
   }
@@ -1499,13 +2027,14 @@
   }
 
   // ─── Queue panel (队列复盘悬浮层) ──────────────────────────────────
-  // Second floating panel: shows /api/queue/today rows, supports draft-copy,
-  // sent/skip/restore, bulk-skip/restore, AI rerank, and click-to-locate on
+  // Second floating panel: shows /api/queue/today rows, supports
+  // skip/restore, bulk-skip/restore, AI rerank, and click-to-locate on
   // the current BOSS page. Coexists with the small scan panel — the scan
   // panel keeps its scan/greet flow untouched. Uses BACKEND_ROOT (no /ext).
   state.queuePanel = {
     open: false,
     tab: 'queue',            // 'queue' | 'skipped'
+    jobId: '',               // queue-only job filter; empty means all jobs
     items: [],               // last-known list (kept in DOM order via diff)
     itemsById: new Map(),    // match_id → item (fast lookup for actions/optimistic revert)
     loading: false,
@@ -1514,6 +2043,19 @@
     bulkGreetRunning: false, // true while doBulkGreet loop is active
     sendingId: null,         // match_id currently being sent (single-row or bulk)
   };
+
+  function renderQueueJobFilter() {
+    const select = document.getElementById('bhq-job-filter');
+    if (!select) return;
+    if (state.queuePanel.jobId && !state.jobs.some(j => String(j.id) === String(state.queuePanel.jobId))) {
+      state.queuePanel.jobId = '';
+    }
+    select.innerHTML = [
+      '<option value="">全部岗位</option>',
+      ...state.jobs.map(j => `<option value="${esc(j.id)}">${esc(j.title)}</option>`),
+    ].join('');
+    select.value = state.queuePanel.jobId;
+  }
 
   function ensureQueuePanel() {
     let el = document.getElementById('boss-helper-queue-panel');
@@ -1532,7 +2074,10 @@
         <span class="bhq-close" id="bhq-close">×</span>
       </div>
       <div class="bhq-toolbar">
-        <button class="bhq-act bhq-act-primary" id="bhq-rerank" style="display:none">AI 精评队列</button>
+        <label class="bhq-filter">岗位
+          <select id="bhq-job-filter"><option value="">全部岗位</option></select>
+        </label>
+        <button class="bhq-act bhq-act-primary" id="bhq-rerank" style="display:none">AI评分</button>
         <button class="bhq-act bhq-act-danger" id="bhq-bulk-skip" style="display:none">一键跳过</button>
         <button class="bhq-act bhq-act-success" id="bhq-bulk-restore" style="display:none">一键恢复</button>
         <span class="bhq-toolbar-status" id="bhq-toolbar-status">就绪</span>
@@ -1544,6 +2089,7 @@
       <div class="bhq-list" id="bhq-list"><div class="bhq-empty">加载中…</div></div>
     `;
     document.body.appendChild(el);
+    renderQueueJobFilter();
 
     // Drag by header
     const header = el.querySelector('.bhq-header');
@@ -1569,7 +2115,7 @@
       t.addEventListener('click', () => {
         const tab = t.getAttribute('data-tab');
         if (tab === state.queuePanel.tab) return;
-        if (state.queuePanel.bulkGreetRunning) {
+        if (state.queuePanel.bulkGreetRunning || state.queuePanel.llmBusy) {
           showToast('批量打招呼进行中，请先停止', true);
           return;
         }
@@ -1585,12 +2131,22 @@
     // Header buttons
     el.querySelector('#bhq-close').addEventListener('click', closeQueuePanel);
     el.querySelector('#bhq-refresh').addEventListener('click', () => {
-      if (state.queuePanel.bulkGreetRunning) { showToast('批量打招呼进行中，请先停止', true); return; }
+      if (state.queuePanel.bulkGreetRunning || state.queuePanel.llmBusy) { showToast('当前任务进行中，请稍后刷新', true); return; }
       fetchQueue(true);
     });
-    el.querySelector('#bhq-rerank').addEventListener('click', doLlmRerank);
+    el.querySelector('#bhq-rerank').addEventListener('click', doTrackedLlmRerank);
     el.querySelector('#bhq-bulk-skip').addEventListener('click', () => doBulkStatus('skipped'));
     el.querySelector('#bhq-bulk-restore').addEventListener('click', () => doBulkStatus('new'));
+    el.querySelector('#bhq-job-filter').addEventListener('change', (e) => {
+      if (state.queuePanel.bulkGreetRunning || state.queuePanel.llmBusy) {
+        e.target.value = state.queuePanel.jobId;
+        showToast('批量打招呼进行中，请先停止', true);
+        return;
+      }
+      state.queuePanel.jobId = e.target.value;
+      applyToolbarVisibility();
+      fetchQueue(true);
+    });
 
     // Row click delegation (locate + action buttons)
     el.querySelector('#bhq-list').addEventListener('click', onListClick);
@@ -1599,19 +2155,36 @@
     return el;
   }
 
+  function getRerankJobId() {
+    if (state.queuePanel.jobId) return state.queuePanel.jobId;
+    const jobIds = [...new Set(state.queuePanel.items.map(item => item.job_id).filter(Boolean))];
+    return jobIds.length === 1 ? jobIds[0] : '';
+  }
+
   function applyToolbarVisibility() {
     const rerank = document.getElementById('bhq-rerank');
     const bulkSkip = document.getElementById('bhq-bulk-skip');
     const bulkRestore = document.getElementById('bhq-bulk-restore');
     if (!rerank) return;
     const isQueue = state.queuePanel.tab === 'queue';
+    const rerankJobId = getRerankJobId();
     rerank.style.display = isQueue ? 'inline-block' : 'none';
+    rerank.disabled = !isQueue || !rerankJobId || state.queuePanel.llmBusy;
+    rerank.title = rerankJobId ? '' : '当前列表包含多个岗位，请先选择一个岗位';
     bulkSkip.style.display = isQueue ? 'inline-block' : 'none';
     bulkRestore.style.display = isQueue ? 'none' : 'inline-block';
+    bulkSkip.disabled = state.queuePanel.llmBusy;
+    bulkRestore.disabled = state.queuePanel.llmBusy;
+    rerank.title = rerankJobId ? '' : '当前列表包含多个岗位，请先选择一个岗位';
   }
 
   function openQueuePanel() {
     const el = ensureQueuePanel();
+    // The queue starts broad so recruiters can review every role first.
+    // AI评分 remains available after selecting one concrete job.
+    state.queuePanel.jobId = '';
+    renderQueueJobFilter();
+    applyToolbarVisibility();
     // Layout: wide screen → side-by-side left of small panel; narrow → stacked
     // below. Judged once on open (not on resize) — cheap & good enough.
     const stacked = window.innerWidth < 1280;
@@ -1670,7 +2243,7 @@
     state.queuePanel.loading = true;
     if (showLoading) setQueueStatus('加载中…');
     const params = new URLSearchParams();
-    if (state.jobId) params.append('job_id', state.jobId);
+    if (state.queuePanel.jobId) params.append('job_id', state.queuePanel.jobId);
     if (state.queuePanel.tab === 'skipped') params.append('status_filter', 'skipped');
     params.append('limit', '100');
     try {
@@ -1678,7 +2251,8 @@
       state.queuePanel.items = Array.isArray(items) ? items : [];
       state.queuePanel.itemsById = new Map(state.queuePanel.items.map(x => [x.match_id, x]));
       diffRenderQueueList(state.queuePanel.items);
-      setQueueStatus(`共 ${state.queuePanel.items.length} 条 · ${new Date().toLocaleTimeString()}`);
+      applyToolbarVisibility();
+      setQueueStatus('就绪');
     } catch (err) {
       setQueueStatus('加载失败: ' + err.message, true);
     } finally {
@@ -1727,9 +2301,6 @@
   // Row template — minimal fields per v1 spec (no CheckBadges/skill tags/preview).
   function buildRowHTML(item) {
     const isSkipped = state.queuePanel.tab === 'skipped';
-    const reasonRaw = item.llm_reason || item.match_reason || '';
-    const reasonCls = item.llm_reason ? 'bhq-reason ai' : 'bhq-reason';
-    const reasonPrefix = item.llm_reason ? 'AI: ' : '';
     const missingHtml = item.missing_info
       ? `<div class="bhq-missing" title="${esc(item.missing_info)}">⚠ 缺：${esc(item.missing_info)}</div>` : '';
     const llmBadge = (item.llm_score != null)
@@ -1737,7 +2308,6 @@
     const actionBtns = isSkipped
       ? `<button class="bhq-act bhq-act-success" data-act="restore" data-mid="${item.match_id}">恢复</button>`
       : `
-        <button class="bhq-act bhq-act-success" data-act="sent" data-mid="${item.match_id}">已发送</button>
         <button class="bhq-act bhq-act-secondary" data-act="skip" data-mid="${item.match_id}">跳过</button>
       `;
     return `
@@ -1745,12 +2315,11 @@
         <div class="bhq-name-line">
           <span class="bhq-status-dot ${item.status || 'new'}" title="${esc(statusTitle(item.status))}"></span>
           <span class="bhq-name">${esc(item.name || '未知')}</span>
+          <span class="bhq-job" title="岗位：${esc(item.job_title || '未指定岗位')}">${esc(item.job_title || '未指定岗位')}</span>
           <span class="bhq-badge ${scoreBadgeClass(item.score)}" title="规则分">${Math.round(item.score)}</span>
           ${llmBadge}
-          ${item.active_status ? `<span class="bhq-active">${esc(item.active_status)}</span>` : ''}
         </div>
         <div class="bhq-info">${esc(buildInfoLine(item))}</div>
-        ${reasonRaw ? `<div class="${reasonCls}" title="${esc(reasonRaw)}">${reasonPrefix}${esc(reasonRaw)}</div>` : ''}
         ${missingHtml}
       </div>
       <div class="bhq-row-actions">${actionBtns}</div>
@@ -1760,7 +2329,7 @@
   // Cheap change-detection signature for a row (score+status+llm_score+reason+sending).
   function rowSig(item) {
     const sending = state.queuePanel.sendingId === item.match_id ? 1 : 0;
-    return `${item.status}|${item.score}|${item.llm_score ?? ''}|${item.llm_reason ?? ''}|${item.match_reason ?? ''}|${item.missing_info ?? ''}|${item.active_status ?? ''}|${sending}`;
+    return `${item.status}|${item.job_id ?? ''}|${item.job_title ?? ''}|${item.score}|${item.llm_score ?? ''}|${item.missing_info ?? ''}|${sending}`;
   }
 
   // Incremental diff render: upsert / remove / move rows by match_id so scroll
@@ -1830,7 +2399,6 @@
         showToast('批量打招呼进行中，请稍候', true);
         return;
       }
-      if (act === 'sent') return handleStatusChange(item, 'sent_manual');
       if (act === 'skip') return handleStatusChange(item, 'skipped');
       if (act === 'restore') return handleStatusChange(item, 'new');
       return;
@@ -2005,7 +2573,9 @@
     const items = state.queuePanel.items;
     if (!items.length) { showToast('列表为空', true); return; }
     const verb = newStatus === 'skipped' ? '跳过' : '恢复';
-    if (!window.confirm(`确定要一键${verb}当前列表中的 ${items.length} 位候选人吗？`)) return;
+    const selectedJob = state.jobs.find(j => String(j.id) === String(state.queuePanel.jobId));
+    const scope = selectedJob ? `岗位“${selectedJob.title}”` : '全部岗位';
+    if (!window.confirm(`确定要一键${verb}${scope}当前列表中的 ${items.length} 位候选人吗？`)) return;
     setQueueStatus(`正在${verb} ${items.length} 位…`);
     try {
       const match_ids = items.map(x => x.match_id);
@@ -2164,14 +2734,14 @@
   async function doLlmRerank() {
     if (state.queuePanel.llmBusy) return;
     const btn = document.getElementById('bhq-rerank');
-    if (!state.jobId) { showToast('未选择岗位', true); return; }
+    if (!state.queuePanel.jobId) { showToast('请选择具体岗位后进行 AI 精评', true); return; }
     state.queuePanel.llmBusy = true;
     if (btn) { btn.disabled = true; btn.textContent = 'AI 评分中…'; }
     setQueueStatus('AI 精评队列中，可能需要 1-3 分钟…');
     try {
       // /llm-rerank lives under /api/ext — reuse old apiPost (with /ext prefix).
       // Backend returns 200 with {configured:false, error} when LLM isn't set.
-      const res = await apiPost('/llm-rerank', { job_id: state.jobId, limit: 60 });
+      const res = await apiPost('/llm-rerank', { job_id: state.queuePanel.jobId, limit: 60 });
       if (res && res.configured === false) {
         const msg = res.error || 'LLM 未配置';
         setQueueStatus(msg, true);
@@ -2192,28 +2762,167 @@
       showToast('AI 精评失败: ' + err.message, true);
     } finally {
       state.queuePanel.llmBusy = false;
-      if (btn) { btn.disabled = false; btn.textContent = 'AI 精评队列'; }
+      if (btn) btn.textContent = 'AI 精评队列';
+      applyToolbarVisibility();
     }
   }
 
-  // Locate a card on the current BOSS page by boss_id (data-expect / data-geek),
-  // scroll+highlight it, AND open the candidate's resume/chat popup (same as the
-  // old cross-tab "跳转到 BOSS" behavior in pollPendingOpen) — row click should
-  // do both, not just scroll.
-  // 1) Prefer the cardEl reference cached in state.scanned (fresh, no re-query).
-  // 2) Fallback: scan all CARD_SEL elements — queue items may be from prior
-  //    scans and the current page might not have been scanned this session.
-  function locateCardOnPage(item) {
-    const target = findCardByBossId(item.boss_id);
-    if (!target) {
-      showToast('未找到卡片，可能已翻页/未扫描到本页', true);
+  async function doTrackedLlmRerank() {
+    if (state.queuePanel.llmBusy || state.queuePanel.bulkGreetRunning) return;
+    const btn = document.getElementById('bhq-rerank');
+    const rerankJobId = getRerankJobId();
+    if (!rerankJobId) { showToast('当前列表包含多个岗位，请先选择一个岗位', true); return; }
+
+    state.queuePanel.llmBusy = true;
+    pauseQueueAutoRefresh();
+    if (btn) { btn.disabled = true; btn.textContent = 'AI评分中'; }
+    showProgress(0, 0, '正在创建评分任务');
+    setQueueStatus('AI评分任务已启动，正在准备候选人…');
+    try {
+      const started = await apiPost('/llm-rerank-jobs', { job_id: rerankJobId, limit: 60 });
+      if (!started || started.error || started.configured === false) {
+        throw new Error((started && started.error) || '无法启动 AI评分任务');
+      }
+
+      while (true) {
+        const task = await apiPost(`/llm-rerank-jobs/${encodeURIComponent(started.task_id)}/status`, {});
+        if (!task || task.error) throw new Error((task && task.error) || '评分任务状态不可用');
+        showProgress(task.processed || 0, task.total || started.total || 0, task.message || '正在评分');
+        setQueueStatus(task.message || '正在评分…', task.status === 'failed');
+
+        if (task.status === 'succeeded') {
+          const summary = `AI评分完成：${task.scored}/${task.total} 人`;
+          showToast(summary);
+          setQueueStatus(summary);
+          await fetchQueue(true);
+          return;
+        }
+        if (task.status === 'failed') throw new Error(task.error || 'AI评分失败');
+        await sleep(1000);
+      }
+    } catch (err) {
+      const message = 'AI评分失败：' + err.message;
+      setQueueStatus(message, true);
+      showToast(message, true);
+    } finally {
+      state.queuePanel.llmBusy = false;
+      resumeQueueAutoRefresh();
+      hideProgress();
+      if (btn) btn.textContent = 'AI评分';
+      applyToolbarVisibility();
+    }
+  }
+
+  // BOSS can stack resume popups. Restrict this to panels that actually expose
+  // a greeting action, so unrelated dialogs (risk controls, settings, etc.)
+  // are never closed by a queue-row click.
+  function findOpenResumePanels() {
+    const panels = [];
+    const selectors = [
+      '.boss-layer__wrapper', '.boss-popup__wrapper', 'div.dialog-wrap',
+      '[class*="resume"][class*="dialog"]', '[class*="resume"][class*="popup"]',
+      '[class*="geek"][class*="detail"]', '[class*="detail"][class*="dialog"]',
+      '[class*="resume"][class*="drawer"]',
+    ].join(',');
+    const ownPanels = [document.getElementById('boss-helper-panel'), document.getElementById('boss-helper-queue-panel')];
+    for (const doc of getAllDocs()) {
+      for (const panel of doc.querySelectorAll(selectors)) {
+        if (!isVisibleElement(panel) || ownPanels.some(own => own && own.contains(panel))) continue;
+        const text = (panel.innerText || '').slice(0, 2000);
+        if (!/(打招呼|联系Ta|联系TA)/.test(text)) continue;
+        if (!panels.includes(panel)) panels.push(panel);
+      }
+    }
+    return panels;
+  }
+
+  function findResumeCloseButton(panel) {
+    const byAttribute = [...panel.querySelectorAll(
+      '[class*="close"], [aria-label*="关闭"], [title*="关闭"], [data-action="close"]'
+    )].filter(isVisibleElement);
+    if (byAttribute.length) return byAttribute[0];
+    return [...panel.querySelectorAll('button, a, span, i, div')]
+      .filter(el => isVisibleElement(el) && el.children.length === 0 && (el.textContent || '').trim() === '×')
+      .sort((a, b) => b.getBoundingClientRect().right - a.getBoundingClientRect().right)[0] || null;
+  }
+
+  async function closeOpenResumePanels() {
+    for (let attempt = 0; attempt < 4; attempt++) {
+      const panels = findOpenResumePanels();
+      if (!panels.length) return true;
+      const panel = panels[panels.length - 1];
+      const close = findResumeCloseButton(panel);
+      if (!close) return false;
+      close.click();
+      const deadline = Date.now() + 1200;
+      while (Date.now() < deadline && isVisibleElement(panel)) await sleep(80);
+    }
+    return findOpenResumePanels().length === 0;
+  }
+
+  async function waitForResumeIdentity(item, timeoutMs = 3000) {
+    const deadline = Date.now() + timeoutMs;
+    let sawPanel = false;
+    while (Date.now() < deadline) {
+      const panels = findOpenResumePanels();
+      if (panels.length) {
+        sawPanel = true;
+        for (const panel of panels) {
+          const ids = [...panel.querySelectorAll('[data-expect], [data-geek], [data-geekid]')]
+            .map(el => el.getAttribute('data-expect') || el.getAttribute('data-geek') || el.getAttribute('data-geekid'));
+          if (ids.includes(item.boss_id)) return 'confirmed';
+          if (item.name && (panel.innerText || '').includes(item.name)) return 'confirmed';
+        }
+      }
+      await sleep(100);
+    }
+    return sawPanel ? 'mismatch' : 'unverified';
+  }
+
+  let resumeOpenInFlight = false;
+
+  // Open exactly one verified resume from a live card. This prevents both
+  // stacked BOSS modals and stale virtual-list references opening another user.
+  async function locateCardOnPage(item) {
+    if (resumeOpenInFlight) {
+      showToast('正在打开上一份简历，请稍候', true);
       return;
     }
-    try { target.scrollIntoView({ behavior: 'smooth', block: 'center' }); } catch {}
-    target.classList.add('bhq-located');
-    setTimeout(() => target.classList.remove('bhq-located'), 2000);
-    openCardChat(target);
-    setQueueStatus(`已定位并打开简历：${item.name || ''}`);
+    resumeOpenInFlight = true;
+    try {
+      if (!await closeOpenResumePanels()) {
+        setQueueStatus('未能自动关闭已有简历，请先关闭后再试', true);
+        showToast('未能自动关闭已有简历，请先关闭后再试', true);
+        return;
+      }
+      const target = findCardByBossId(item.boss_id);
+      if (!target || getCardCandidateId(target) !== item.boss_id) {
+        setQueueStatus('未找到与队列记录一致的当前卡片，未执行打开操作', true);
+        showToast('未找到与队列记录一致的当前卡片', true);
+        return;
+      }
+      try { target.scrollIntoView({ behavior: 'smooth', block: 'center' }); } catch {}
+      target.classList.add('bhq-located');
+      setTimeout(() => target.classList.remove('bhq-located'), 2000);
+      if (!openCardChat(target)) {
+        setQueueStatus('未找到该候选人的简历入口', true);
+        showToast('未找到该候选人的简历入口', true);
+        return;
+      }
+      const result = await waitForResumeIdentity(item);
+      if (result === 'confirmed') {
+        setQueueStatus(`已定位并打开简历：${item.name || ''}`);
+        return;
+      }
+      if (result === 'mismatch') await closeOpenResumePanels();
+      const message = result === 'mismatch'
+        ? '打开的简历与所选候选人不一致，已自动关闭'
+        : '简历层未出现或无法确认候选人身份，请重试';
+      setQueueStatus(message, true);
+      showToast(message, true);
+    } finally {
+      resumeOpenInFlight = false;
+    }
   }
 
   bindBadgeListeners();

@@ -47,6 +47,45 @@ def _migrate_sqlite():
         if "llm_reason" not in cols:
             conn.execute(text("ALTER TABLE match_results ADD COLUMN llm_reason TEXT DEFAULT ''"))
 
+        job_cols = {row[1] for row in conn.execute(text("PRAGMA table_info(jobs)"))}
+        added_job_filter_cols = False
+        if "age_min" not in job_cols:
+            conn.execute(text("ALTER TABLE jobs ADD COLUMN age_min INTEGER DEFAULT 24"))
+            added_job_filter_cols = True
+        if "min_experience_years" not in job_cols:
+            conn.execute(text("ALTER TABLE jobs ADD COLUMN min_experience_years INTEGER DEFAULT 3"))
+            added_job_filter_cols = True
+        if "salary_min_k" not in job_cols:
+            conn.execute(text("ALTER TABLE jobs ADD COLUMN salary_min_k INTEGER DEFAULT 0"))
+        if "salary_max_k" not in job_cols:
+            conn.execute(text("ALTER TABLE jobs ADD COLUMN salary_max_k INTEGER DEFAULT 0"))
+        if "active_requirement" not in job_cols:
+            conn.execute(text("ALTER TABLE jobs ADD COLUMN active_requirement VARCHAR(32) DEFAULT 'any'"))
+            added_job_filter_cols = True
+        if "turnover_frequency" not in job_cols:
+            conn.execute(text("ALTER TABLE jobs ADD COLUMN turnover_frequency VARCHAR(32) DEFAULT 'any'"))
+        if added_job_filter_cols:
+            from app.seed_data import DEFAULT_JOBS
+
+            for job in DEFAULT_JOBS:
+                conn.execute(
+                    text(
+                        """
+                        UPDATE jobs
+                        SET age_min = :age_min,
+                            min_experience_years = :min_experience_years,
+                            active_requirement = :active_requirement
+                        WHERE id = :id
+                        """
+                    ),
+                    {
+                        "id": job["id"],
+                        "age_min": job.get("age_min", 0),
+                        "min_experience_years": job.get("min_experience_years", 0),
+                        "active_requirement": job.get("active_requirement", "any"),
+                    },
+                )
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):

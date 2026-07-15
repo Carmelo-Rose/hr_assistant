@@ -18,7 +18,10 @@ try:
     from pyzbar.pyzbar import decode as decode_qr
     import io
     HAS_QR_DECODER = True
-except ImportError:
+except Exception:
+    # Windows often misses the native zbar DLL even when pyzbar is installed.
+    # QR decoding is only used by legacy flows, so the main service should still
+    # start normally without it.
     HAS_QR_DECODER = False
 
 logger = logging.getLogger(__name__)

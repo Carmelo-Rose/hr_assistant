@@ -80,6 +80,10 @@ def build_job_desc(job) -> str:
         parts.append(f"经验要求关键词：{job.experience_keywords}")
     if job.capability_keywords:
         parts.append(f"能力要求关键词：{job.capability_keywords}")
+    salary_min_k = getattr(job, "salary_min_k", 0) or 0
+    salary_max_k = getattr(job, "salary_max_k", 0) or 0
+    if salary_min_k or salary_max_k:
+        parts.append(f"月薪范围：{salary_min_k or 0}-{salary_max_k or '不限'}K")
     if job.age_max and job.age_max < 99:
         parts.append(f"年龄上限：{job.age_max}岁")
     return "\n".join(parts)

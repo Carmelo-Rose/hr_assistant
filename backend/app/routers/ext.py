@@ -5,20 +5,23 @@ inside the user's real Chrome on zhipin.com. No Playwright dependency.
 """
 
 import logging
+from threading import Thread
 
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from app.models.database import get_db
+from app.models.database import SessionLocal, get_db
 from app.models.candidate import Candidate
 from app.models.match_result import MatchResult
 from app.models.outreach import OutreachRecord
 from app.models.job import Job
+from app.routers.jobs import JobCreate, JobOut, JobPatch, create_job, patch_job
 from app.services.scoring import batch_score_candidate, score_candidate_by_job, load_profile
 from app.services.ingest import upsert_candidate
 from app.services.templating import render_draft
 from app.services import llm_scoring
+from app.services.rerank_jobs import rerank_jobs
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -233,6 +236,19 @@ class ExtRerankRequest(BaseModel):
     limit: int = 60  # safety cap on how many candidates to send to the LLM
 
 
+def _rerank_rows(db: Session, job_id: str, limit: int):
+    """Return the same score-ordered shortlist for sync and tracked scoring."""
+    return (
+        db.query(MatchResult, Candidate)
+        .join(Candidate, MatchResult.candidate_id == Candidate.id)
+        .filter(MatchResult.job_id == job_id)
+        .filter(~MatchResult.status.in_(["sent_manual", "skipped"]))
+        .order_by(MatchResult.score.desc())
+        .limit(max(1, min(limit, 200)))
+        .all()
+    )
+
+
 def _candidate_brief(c: Candidate) -> dict:
     """Compact candidate summary for the LLM (id keyed to DB candidate.id)."""
     return {
@@ -241,6 +257,7 @@ def _candidate_brief(c: Candidate) -> dict:
         "年龄": c.age,
         "学历": c.education or "",
         "经验": c.work_years or "",
+        "期望薪资": c.salary_range or "",
         "公司": c.current_company or "",
         "职位": c.current_position or "",
         "技能": c.skills or "",
@@ -267,15 +284,7 @@ def ext_llm_rerank(req: ExtRerankRequest, db: Session = Depends(get_db)):
         return {"configured": True, "error": "无岗位配置", "scored": 0}
 
     # 取该岗位下待处理(未发送/未跳过)的候选人,按规则分高→低,限量送评
-    q = (
-        db.query(MatchResult, Candidate)
-        .join(Candidate, MatchResult.candidate_id == Candidate.id)
-        .filter(MatchResult.job_id == job.id)
-        .filter(~MatchResult.status.in_(["sent_manual", "skipped"]))
-        .order_by(MatchResult.score.desc())
-        .limit(max(1, min(req.limit, 200)))
-    )
-    rows = q.all()
+    rows = _rerank_rows(db, job.id, req.limit)
     if not rows:
         return {"configured": True, "scored": 0, "message": "队列为空,无可精评的候选人"}
 
@@ -304,6 +313,112 @@ def ext_llm_rerank(req: ExtRerankRequest, db: Session = Depends(get_db)):
         "total": len(rows),
         "job_title": job.title,
     }
+
+
+def _run_tracked_rerank(task_id: str, rows: list[tuple[int, int, dict]], job_desc: str) -> None:
+    """Score one LLM batch at a time and expose only completed, durable work."""
+    rerank_jobs.update(task_id, status="running", message="正在准备候选人信息")
+    # The userscript progress UI is deliberately one candidate at a time:
+    # each visible increment represents a completed, committed LLM result.
+    # The legacy synchronous endpoint keeps its configurable larger batches.
+    batch_size = 1
+    processed = 0
+    scored = 0
+    try:
+        for start in range(0, len(rows), batch_size):
+            batch = rows[start : start + batch_size]
+            rerank_jobs.update(
+                task_id,
+                message=f"正在评分第 {start // batch_size + 1} 批（{len(batch)} 人）",
+            )
+            scores = llm_scoring.score_batch([brief for _, _, brief in batch], job_desc)
+
+            # The scoring response is committed batch-by-batch.  A later error
+            # never hides progress the user has already seen as completed.
+            db = SessionLocal()
+            try:
+                for match_id, candidate_id, _ in batch:
+                    result = scores.get(candidate_id)
+                    if not result:
+                        continue
+                    db.query(MatchResult).filter(MatchResult.id == match_id).update({
+                        "llm_score": result["score"],
+                        "llm_reason": result["reason"],
+                    })
+                    scored += 1
+                db.commit()
+            finally:
+                db.close()
+
+            processed += len(batch)
+            rerank_jobs.update(
+                task_id,
+                processed=processed,
+                scored=scored,
+                message=f"已完成 {processed}/{len(rows)} 位候选人评分",
+            )
+    except Exception as exc:
+        logger.exception("AI 评分任务失败")
+        rerank_jobs.update(
+            task_id,
+            status="failed",
+            processed=processed,
+            scored=scored,
+            error=f"LLM 调用失败: {exc}",
+            message="AI评分失败",
+        )
+        return
+
+    rerank_jobs.update(
+        task_id,
+        status="succeeded",
+        processed=processed,
+        scored=scored,
+        message=f"AI评分完成：已写入 {scored}/{len(rows)} 人",
+    )
+
+
+@router.post("/llm-rerank-jobs", status_code=202)
+def start_llm_rerank_job(req: ExtRerankRequest, db: Session = Depends(get_db)):
+    """Start a tracked scoring task for the userscript queue panel."""
+    if not llm_scoring.is_configured():
+        return {
+            "configured": False,
+            "error": f"LLM 未配置 —— {llm_scoring.config_hint()}。请在 backend/.env 设置后重启。",
+        }
+    if not req.job_id:
+        return {"configured": True, "error": "请选择具体岗位后进行 AI评分"}
+
+    job = db.query(Job).filter(Job.id == req.job_id).first()
+    if job is None:
+        return {"configured": True, "error": "岗位不存在"}
+    rows = _rerank_rows(db, job.id, req.limit)
+    if not rows:
+        return {"configured": True, "error": "队列为空，无可评分的候选人"}
+
+    task = rerank_jobs.create(job_id=job.id, job_title=job.title, total=len(rows))
+    snapshot = [(mr.id, candidate.id, _candidate_brief(candidate)) for mr, candidate in rows]
+    Thread(
+        target=_run_tracked_rerank,
+        args=(task.id, snapshot, llm_scoring.build_job_desc(job)),
+        name=f"llm-rerank-{task.id[:8]}",
+        daemon=True,
+    ).start()
+    return {"configured": True, "task_id": task.id, "total": task.total, "job_title": task.job_title}
+
+
+@router.get("/llm-rerank-jobs/{task_id}")
+def get_llm_rerank_job(task_id: str):
+    task = rerank_jobs.get(task_id)
+    if task is None:
+        return {"error": "评分任务不存在或服务已重启"}
+    return task
+
+
+@router.post("/llm-rerank-jobs/{task_id}/status")
+def get_llm_rerank_job_status(task_id: str):
+    """POST polling fallback for restrictive userscript/network environments."""
+    return get_llm_rerank_job(task_id)
 
 
 # ── POST /api/ext/llm-draft ──────────────────────────────────────────
@@ -392,11 +507,22 @@ def ext_pending_open():
 
 # ── GET /api/ext/jobs ────────────────────────────────────────────────
 
-@router.get("/jobs")
+@router.get("/jobs", response_model=list[JobOut])
 def ext_jobs(db: Session = Depends(get_db)):
     """List workbench jobs for the userscript's job picker."""
-    jobs = db.query(Job).all()
-    return [{"id": j.id, "title": j.title} for j in jobs]
+    return db.query(Job).all()
+
+
+@router.post("/jobs", response_model=JobOut)
+def ext_create_job(payload: JobCreate, db: Session = Depends(get_db)):
+    """Create a workbench job from the userscript panel."""
+    return create_job(payload, db)
+
+
+@router.patch("/jobs/{job_id}", response_model=JobOut)
+def ext_patch_job(job_id: str, patch: JobPatch, db: Session = Depends(get_db)):
+    """Update a workbench job from the userscript panel."""
+    return patch_job(job_id, patch, db)
 
 
 # ── GET /api/ext/config ──────────────────────────────────────────────
