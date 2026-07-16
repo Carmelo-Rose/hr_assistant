@@ -1,5 +1,6 @@
 """Today's outreach queue."""
 
+from datetime import datetime
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Query
@@ -42,6 +43,18 @@ class QueueItem(BaseModel):
     job_status: str = ""
     expected_city: str = ""
     skills: str = ""
+    # Persisted candidate archive fields. The userscript uses these when the
+    # live BOSS card is no longer rendered after a refresh or page change.
+    company: str = ""
+    title: str = ""
+    school: str = ""
+    major: str = ""
+    experience_summary: str = ""
+    raw_snapshot: str = ""
+    source_keyword: str = ""
+    share_url: str = ""
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
 
 
 @router.get("/queue/today")
@@ -93,6 +106,18 @@ def get_today_queue(
             Candidate.job_status,
             Candidate.expected_city,
             Candidate.skills,
+            Candidate.company,
+            Candidate.title,
+            Candidate.current_company,
+            Candidate.current_position,
+            Candidate.school,
+            Candidate.major,
+            Candidate.experience_summary,
+            Candidate.raw_snapshot,
+            Candidate.source_keyword,
+            Candidate.share_url,
+            Candidate.created_at,
+            Candidate.updated_at,
             Job.title.label("job_title"),
             OutreachRecord.id.label("outreach_id"),
         )
@@ -110,7 +135,10 @@ def get_today_queue(
     items = []
     for row in results:
         (mr, name, active_status, boss_id, age, education, work_years,
-         salary_range, job_status, expected_city, skills, job_title, outreach_id) = row
+         salary_range, job_status, expected_city, skills, company, title,
+         current_company, current_position, school, major, experience_summary,
+         raw_snapshot, source_keyword, share_url, created_at, updated_at,
+         job_title, outreach_id) = row
         key = (mr.candidate_id, mr.job_id)
         if key in seen:
             continue
@@ -140,6 +168,16 @@ def get_today_queue(
             job_status=job_status or "",
             expected_city=expected_city or "",
             skills=skills or "",
+            company=company or current_company or "",
+            title=title or current_position or "",
+            school=school or "",
+            major=major or "",
+            experience_summary=experience_summary or "",
+            raw_snapshot=raw_snapshot or "",
+            source_keyword=source_keyword or "",
+            share_url=share_url or "",
+            created_at=created_at,
+            updated_at=updated_at,
         ))
 
     if limit is not None:

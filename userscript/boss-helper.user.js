@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BOSS 招聘助手 — 油猴版
 // @namespace    https://github.com/hr_assistant
-// @version      1.20.17
+// @version      1.22.1
 // @description  在 BOSS 直聘页面内扫描候选人、评分、队列复盘、辅助话术
 // @match        https://www.zhipin.com/*
 // @noframes
@@ -234,6 +234,18 @@
       : '';
   }
 
+  // Save a real candidate/detail link when BOSS exposes one on the identity
+  // element. Many newer cards are button-driven and have no durable URL; in
+  // that case this deliberately returns empty instead of saving the list URL.
+  function getCandidateShareUrl(card, idEl) {
+    const identityAnchor =
+      (idEl && idEl.matches?.('a[href]') ? idEl : null) ||
+      idEl?.closest?.('a[href]') ||
+      idEl?.querySelector?.('a[href]') ||
+      card.querySelector('.name-wrap a[href], a[data-contact][href], a[class*="name"][href]');
+    return identityAnchor ? safeBossUrl(identityAnchor.href || '') : '';
+  }
+
   function isVisibleElement(el) {
     if (!el || !el.isConnected || !el.getClientRects().length) return false;
     const style = el.ownerDocument.defaultView.getComputedStyle(el);
@@ -364,12 +376,13 @@
         : '';
       const lid = idEl ? (idEl.getAttribute('data-lid') || '') : '';
       const jid = idEl ? (idEl.getAttribute('data-jid') || '') : '';
+      const shareUrl = getCandidateShareUrl(card, idEl);
 
       results.push({
         index: idx, name, age, experience, education, jobStatus, salary, activeStatus,
         skills: skills.slice(0, 8),
         expectCity, company, title, school, major,
-        expectId, lid, jid,
+        expectId, lid, jid, shareUrl,
         fullText: text.slice(0, 500),
         cardEl: card,  // DOM reference
       });
@@ -594,7 +607,7 @@
   // the clipboard so the actual selector mismatch can be identified without
   // opening DevTools (which BOSS's anti-debug bounces to about:blank).
   function dumpChatInputDiag() {
-    const ourPanels = [document.getElementById('boss-helper-panel'), document.getElementById('boss-helper-queue-panel')];
+    const ourPanels = [document.getElementById('boss-helper-panel'), document.getElementById('boss-helper-queue-panel'), document.getElementById('boss-helper-candidate-archive')];
     const inputs = [];
     const panels = [];
     const iframes = [];
@@ -895,7 +908,7 @@
   // panel, whose greet button lives in the c-resume iframe). Tight regex
   // (^打招呼$) so it never matches the sidebar 沟通 menu item.
   function clickGreetButtonAnywhere() {
-    const ourPanels = [document.getElementById('boss-helper-panel'), document.getElementById('boss-helper-queue-panel')];
+    const ourPanels = [document.getElementById('boss-helper-panel'), document.getElementById('boss-helper-queue-panel'), document.getElementById('boss-helper-candidate-archive')];
     for (const doc of getAllDocs()) {
       for (const sel of ['button.btn-greet', 'button.btn-getcontact', 'button[class*="getcontact"]', 'a.btn-greet', 'a[class*="greet"]', 'button[class*="greet"]']) {
         const btn = doc.querySelector(sel);
@@ -1134,6 +1147,12 @@
       border-radius: 10px; background: #eef2ff; color: #4355b9;
       font-size: 11px; line-height: 1.4;
     }
+    .bhq-presence {
+      display: inline-block; padding: 1px 7px; border-radius: 999px;
+      font-size: 10px; font-weight: 700; line-height: 1.5;
+    }
+    .bhq-presence.live { color: #167144; background: #e6f7ed; }
+    .bhq-presence.history { color: #956000; background: #fff4d8; }
     .bhq-badge {
       display: inline-block; padding: 1px 7px; border-radius: 10px;
       font-size: 11px; font-weight: 600; line-height: 1.4;
@@ -1201,6 +1220,68 @@
       outline-offset: 2px;
       transition: outline 0.15s;
     }
+
+    /* Candidate archive drawer: a read-only fallback when the real BOSS card
+       is no longer rendered. It never impersonates BOSS's native resume UI. */
+    .bh-archive-backdrop {
+      position: fixed; inset: 0; z-index: 100002;
+      background: rgba(20, 28, 56, .28); backdrop-filter: blur(1px);
+    }
+    #boss-helper-candidate-archive {
+      position: fixed; top: 0; right: 0; bottom: 0; z-index: 100003;
+      width: min(440px, 96vw); display: flex; flex-direction: column;
+      background: #f7f8fd; color: #24304f;
+      box-shadow: -16px 0 48px rgba(22, 35, 90, .22);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      animation: bhArchiveIn .18s ease-out;
+    }
+    @keyframes bhArchiveIn { from { transform: translateX(24px); opacity: .5; } to { transform: translateX(0); opacity: 1; } }
+    .bh-archive-header {
+      display: flex; align-items: center; gap: 10px; padding: 16px 18px;
+      color: #fff; background: linear-gradient(135deg, #536dfe, #4355cc);
+    }
+    .bh-archive-header-main { flex: 1; min-width: 0; }
+    .bh-archive-eyebrow { font-size: 11px; opacity: .82; margin-bottom: 2px; }
+    .bh-archive-header h3 { margin: 0; font-size: 17px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .bh-archive-close {
+      width: 30px; height: 30px; border: 0; border-radius: 8px; cursor: pointer;
+      color: #fff; background: rgba(255,255,255,.14); font-size: 22px; line-height: 28px;
+    }
+    .bh-archive-close:hover { background: rgba(255,255,255,.25); }
+    .bh-archive-notice {
+      margin: 14px 16px 0; padding: 10px 12px; border-radius: 9px;
+      font-size: 12px; line-height: 1.55;
+    }
+    .bh-archive-notice.live { color: #176b3a; background: #eaf8ef; border: 1px solid #ccebd8; }
+    .bh-archive-notice.history { color: #805100; background: #fff8e7; border: 1px solid #f3dfaa; }
+    .bh-archive-body { flex: 1; overflow-y: auto; padding: 14px 16px 24px; }
+    .bh-archive-card {
+      margin-bottom: 12px; padding: 14px; background: #fff;
+      border: 1px solid #e8ebf5; border-radius: 11px;
+    }
+    .bh-archive-title { margin: 0 0 10px; color: #29355d; font-size: 12px; font-weight: 700; }
+    .bh-archive-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 14px; }
+    .bh-archive-field { min-width: 0; }
+    .bh-archive-label { display: block; margin-bottom: 3px; color: #8a93a9; font-size: 10px; }
+    .bh-archive-value { color: #303a59; font-size: 12px; line-height: 1.45; overflow-wrap: anywhere; }
+    .bh-archive-scores { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .bh-archive-score { padding: 12px; border-radius: 9px; background: #f4f6ff; }
+    .bh-archive-score b { display: block; margin-top: 2px; color: #4055cc; font-size: 22px; }
+    .bh-archive-text { color: #4a536e; font-size: 12px; line-height: 1.7; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .bh-archive-tags { display: flex; flex-wrap: wrap; gap: 6px; }
+    .bh-archive-tag { padding: 3px 8px; border-radius: 999px; color: #4d5eb3; background: #eef1ff; font-size: 11px; }
+    .bh-archive-footer {
+      display: flex; flex-wrap: wrap; gap: 8px; padding: 12px 16px 16px; background: #fff;
+      border-top: 1px solid #e7eaf3;
+    }
+    .bh-archive-btn {
+      min-height: 36px; padding: 8px 13px; border: 0; border-radius: 8px;
+      cursor: pointer; font-size: 12px; font-weight: 700;
+    }
+    .bh-archive-btn.primary { flex: 1; color: #fff; background: #4f6ef7; }
+    .bh-archive-btn.secondary { color: #46506c; background: #edf0f7; }
+    .bh-archive-btn.link { color: #4055cc; background: #eef1ff; }
+    .bh-archive-btn:disabled { cursor: not-allowed; opacity: .48; }
   `);
 
   function createPanel() {
@@ -2077,7 +2158,7 @@
         <label class="bhq-filter">岗位
           <select id="bhq-job-filter"><option value="">全部岗位</option></select>
         </label>
-        <button class="bhq-act bhq-act-primary" id="bhq-rerank" style="display:none">AI评分</button>
+        <button class="bhq-act bhq-act-primary" id="bhq-rerank" style="display:none" title="只评分尚未有 AI 分数的候选人">AI评分</button>
         <button class="bhq-act bhq-act-danger" id="bhq-bulk-skip" style="display:none">一键跳过</button>
         <button class="bhq-act bhq-act-success" id="bhq-bulk-restore" style="display:none">一键恢复</button>
         <span class="bhq-toolbar-status" id="bhq-toolbar-status">就绪</span>
@@ -2170,12 +2251,12 @@
     const rerankJobId = getRerankJobId();
     rerank.style.display = isQueue ? 'inline-block' : 'none';
     rerank.disabled = !isQueue || !rerankJobId || state.queuePanel.llmBusy;
-    rerank.title = rerankJobId ? '' : '当前列表包含多个岗位，请先选择一个岗位';
+    rerank.title = rerankJobId ? '只评分尚未有 AI 分数的候选人' : '当前列表包含多个岗位，请先选择一个岗位';
     bulkSkip.style.display = isQueue ? 'inline-block' : 'none';
     bulkRestore.style.display = isQueue ? 'none' : 'inline-block';
     bulkSkip.disabled = state.queuePanel.llmBusy;
     bulkRestore.disabled = state.queuePanel.llmBusy;
-    rerank.title = rerankJobId ? '' : '当前列表包含多个岗位，请先选择一个岗位';
+    rerank.title = rerankJobId ? '只评分尚未有 AI 分数的候选人' : '当前列表包含多个岗位，请先选择一个岗位';
   }
 
   function openQueuePanel() {
@@ -2210,6 +2291,7 @@
   function closeQueuePanel() {
     const el = document.getElementById('boss-helper-queue-panel');
     if (el) el.style.display = 'none';
+    closeCandidateArchive();
     state.queuePanel.open = false;
     if (state.queuePanel.autoRefreshTimer) {
       clearInterval(state.queuePanel.autoRefreshTimer);
@@ -2298,23 +2380,37 @@
     return parts.join(' · ');
   }
 
+  function currentPageBossIds() {
+    const ids = new Set();
+    for (const doc of getAllDocs()) {
+      for (const card of doc.querySelectorAll(CARD_SEL)) {
+        const id = getCardCandidateId(card);
+        if (id) ids.add(String(id));
+      }
+    }
+    return ids;
+  }
+
   // Row template — minimal fields per v1 spec (no CheckBadges/skill tags/preview).
-  function buildRowHTML(item) {
+  function buildRowHTML(item, isLive) {
     const isSkipped = state.queuePanel.tab === 'skipped';
     const missingHtml = item.missing_info
       ? `<div class="bhq-missing" title="${esc(item.missing_info)}">⚠ 缺：${esc(item.missing_info)}</div>` : '';
     const llmBadge = (item.llm_score != null)
       ? `<span class="bhq-badge ${llmBadgeClass(item.llm_score)}" title="AI 精评分">AI ${Math.round(item.llm_score)}</span>` : '';
-    const actionBtns = isSkipped
+    const candidateAction = isLive
+      ? `<button class="bhq-act bhq-act-primary" data-act="locate" data-mid="${item.match_id}">打开</button>`
+      : `<button class="bhq-act bhq-act-secondary" data-act="archive" data-mid="${item.match_id}">档案</button>`;
+    const statusAction = isSkipped
       ? `<button class="bhq-act bhq-act-success" data-act="restore" data-mid="${item.match_id}">恢复</button>`
-      : `
-        <button class="bhq-act bhq-act-secondary" data-act="skip" data-mid="${item.match_id}">跳过</button>
-      `;
+      : `<button class="bhq-act bhq-act-secondary" data-act="skip" data-mid="${item.match_id}">跳过</button>`;
+    const actionBtns = candidateAction + statusAction;
     return `
       <div class="bhq-row-main">
         <div class="bhq-name-line">
           <span class="bhq-status-dot ${item.status || 'new'}" title="${esc(statusTitle(item.status))}"></span>
           <span class="bhq-name">${esc(item.name || '未知')}</span>
+          <span class="bhq-presence ${isLive ? 'live' : 'history'}">${isLive ? '当前页' : '历史'}</span>
           <span class="bhq-job" title="岗位：${esc(item.job_title || '未指定岗位')}">${esc(item.job_title || '未指定岗位')}</span>
           <span class="bhq-badge ${scoreBadgeClass(item.score)}" title="规则分">${Math.round(item.score)}</span>
           ${llmBadge}
@@ -2326,10 +2422,157 @@
     `;
   }
 
+  function archiveTime(value) {
+    if (!value) return '';
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return '';
+    return date.toLocaleString('zh-CN', { hour12: false });
+  }
+
+  function archiveField(label, value) {
+    if (!value) return '';
+    return `<div class="bh-archive-field"><span class="bh-archive-label">${esc(label)}</span><div class="bh-archive-value">${esc(value)}</div></div>`;
+  }
+
+  function archiveSection(title, content, rawHtml = false) {
+    if (!content) return '';
+    return `<section class="bh-archive-card"><h4 class="bh-archive-title">${esc(title)}</h4><div class="${rawHtml ? '' : 'bh-archive-text'}">${rawHtml ? content : esc(content)}</div></section>`;
+  }
+
+  function safeBossUrl(value) {
+    if (!value) return '';
+    try {
+      const url = new URL(value);
+      const isBossHost = url.hostname === 'zhipin.com' || url.hostname.endsWith('.zhipin.com');
+      return url.protocol === 'https:' && isBossHost ? url.href : '';
+    } catch {
+      return '';
+    }
+  }
+
+  let candidateArchiveKeyHandler = null;
+
+  function closeCandidateArchive() {
+    document.getElementById('boss-helper-candidate-archive')?.remove();
+    document.getElementById('boss-helper-candidate-archive-backdrop')?.remove();
+    if (candidateArchiveKeyHandler) {
+      document.removeEventListener('keydown', candidateArchiveKeyHandler);
+      candidateArchiveKeyHandler = null;
+    }
+  }
+
+  function openCandidateArchive(item, options = {}) {
+    if (!item) return;
+    closeCandidateArchive();
+
+    const hasLiveCard = !!(item.boss_id && findCardByBossId(item.boss_id));
+    const basics = buildInfoLine(item);
+    const work = [item.company, item.title].filter(Boolean).join(' · ');
+    const education = [item.school, item.major].filter(Boolean).join(' · ');
+    const savedAt = archiveTime(item.updated_at || item.created_at);
+    const snapshot = item.experience_summary || item.raw_snapshot || '';
+    const shareUrl = safeBossUrl(item.share_url);
+    const tags = String(item.skills || '').split(/[,，、]/).map(x => x.trim()).filter(Boolean);
+    const tagsHtml = tags.length
+      ? `<div class="bh-archive-tags">${tags.map(x => `<span class="bh-archive-tag">${esc(x)}</span>`).join('')}</div>`
+      : '';
+    const notice = hasLiveCard
+      ? '当前页面仍有该候选人的真实卡片，可以继续打开 BOSS 原生卡片并打招呼。'
+      : (options.reason || '当前页面没有该候选人的真实卡片。这里展示的是最近一次保存的档案，档案本身不能直接打招呼。');
+
+    const backdrop = document.createElement('div');
+    backdrop.id = 'boss-helper-candidate-archive-backdrop';
+    backdrop.className = 'bh-archive-backdrop';
+    const drawer = document.createElement('aside');
+    drawer.id = 'boss-helper-candidate-archive';
+    drawer.setAttribute('role', 'dialog');
+    drawer.setAttribute('aria-modal', 'true');
+    drawer.setAttribute('aria-label', `${item.name || '候选人'}档案`);
+    drawer.innerHTML = `
+      <header class="bh-archive-header">
+        <div class="bh-archive-header-main">
+          <div class="bh-archive-eyebrow">候选人档案 · 只读快照</div>
+          <h3>${esc(item.name || '未知候选人')}</h3>
+        </div>
+        <button class="bh-archive-close" data-archive-act="close" aria-label="关闭">×</button>
+      </header>
+      <div class="bh-archive-notice ${hasLiveCard ? 'live' : 'history'}">${esc(notice)}</div>
+      <div class="bh-archive-body">
+        <section class="bh-archive-card">
+          <h4 class="bh-archive-title">基本资料</h4>
+          <div class="bh-archive-grid">
+            ${archiveField('匹配岗位', item.job_title || '未指定岗位')}
+            ${archiveField('基础信息', basics || '暂无')}
+            ${archiveField('当前经历', work)}
+            ${archiveField('院校专业', education)}
+            ${archiveField('求职状态', item.job_status)}
+            ${archiveField('活跃状态', item.active_status)}
+            ${archiveField('来源关键词', item.source_keyword)}
+            ${archiveField('最近保存', savedAt)}
+          </div>
+        </section>
+        <section class="bh-archive-card">
+          <h4 class="bh-archive-title">匹配评分</h4>
+          <div class="bh-archive-scores">
+            <div class="bh-archive-score"><span class="bh-archive-label">规则评分</span><b>${Math.round(Number(item.score) || 0)}</b></div>
+            <div class="bh-archive-score"><span class="bh-archive-label">AI 精评分</span><b>${item.llm_score == null ? '—' : Math.round(Number(item.llm_score) || 0)}</b></div>
+          </div>
+        </section>
+        ${archiveSection('技能标签', tagsHtml, true)}
+        ${archiveSection('匹配理由', item.match_reason)}
+        ${archiveSection('AI 精评理由', item.llm_reason)}
+        ${archiveSection('资料缺失提醒', item.missing_info)}
+        ${archiveSection('候选人经历快照', snapshot)}
+      </div>
+      <footer class="bh-archive-footer">
+        <button class="bh-archive-btn secondary" data-archive-act="close">关闭</button>
+        ${shareUrl ? '<button class="bh-archive-btn link" data-archive-act="link">打开保存链接</button>' : ''}
+        <button class="bh-archive-btn primary" data-archive-act="${hasLiveCard ? 'locate' : 'retry'}" ${item.boss_id ? '' : 'disabled'}>${hasLiveCard ? '打开 BOSS 原生卡片' : (item.boss_id ? '重新检查当前页' : '缺少定位 ID')}</button>
+      </footer>
+    `;
+
+    backdrop.addEventListener('click', closeCandidateArchive);
+    drawer.addEventListener('click', (e) => {
+      const btn = e.target.closest('[data-archive-act]');
+      if (!btn) return;
+      const act = btn.getAttribute('data-archive-act');
+      if (act === 'close') return closeCandidateArchive();
+      if (act === 'link' && shareUrl) {
+        window.open(shareUrl, '_blank', 'noopener,noreferrer');
+        return;
+      }
+      if (act === 'locate' && hasLiveCard) {
+        closeCandidateArchive();
+        locateCardOnPage(item, { fallbackToArchive: true });
+        return;
+      }
+      if (act === 'retry' && item.boss_id) retryLocateCandidate(item);
+    });
+    candidateArchiveKeyHandler = (e) => {
+      if (e.key === 'Escape') closeCandidateArchive();
+    };
+    document.addEventListener('keydown', candidateArchiveKeyHandler);
+    document.body.appendChild(backdrop);
+    document.body.appendChild(drawer);
+    drawer.querySelector('.bh-archive-close')?.focus();
+  }
+
+  function retryLocateCandidate(item) {
+    closeCandidateArchive();
+    if (findCardByBossId(item.boss_id)) {
+      diffRenderQueueList(state.queuePanel.items);
+      return locateCardOnPage(item, { fallbackToArchive: true });
+    }
+    openCandidateArchive(item, {
+      reason: '已检查当前页面已经渲染的候选人卡片，仍未找到该候选人。为降低风控风险，脚本不会自动滚动、翻页或持续查找。',
+    });
+    showToast('当前页仍未找到该候选人');
+  }
+
   // Cheap change-detection signature for a row (score+status+llm_score+reason+sending).
-  function rowSig(item) {
+  function rowSig(item, isLive) {
     const sending = state.queuePanel.sendingId === item.match_id ? 1 : 0;
-    return `${item.status}|${item.job_id ?? ''}|${item.job_title ?? ''}|${item.score}|${item.llm_score ?? ''}|${item.missing_info ?? ''}|${sending}`;
+    return `${item.status}|${item.job_id ?? ''}|${item.job_title ?? ''}|${item.score}|${item.llm_score ?? ''}|${item.missing_info ?? ''}|${isLive ? 1 : 0}|${sending}`;
   }
 
   // Incremental diff render: upsert / remove / move rows by match_id so scroll
@@ -2347,6 +2590,7 @@
     const empty = listEl.querySelector('.bhq-empty');
     if (empty) empty.remove();
 
+    const liveBossIds = currentPageBossIds();
     const existing = new Map();
     for (const child of Array.from(listEl.children)) {
       const mid = child.getAttribute('data-mid');
@@ -2361,19 +2605,20 @@
 
     let prev = null;
     for (const item of items) {
+      const isLive = !!item.boss_id && liveBossIds.has(String(item.boss_id));
       let node = existing.get(item.match_id);
       if (!node) {
         node = document.createElement('div');
         node.className = 'bhq-row';
         node.setAttribute('data-mid', String(item.match_id));
         if (item.boss_id) node.setAttribute('data-bossid', item.boss_id);
-        node.innerHTML = buildRowHTML(item);
-        node._sig = rowSig(item);
+        node.innerHTML = buildRowHTML(item, isLive);
+        node._sig = rowSig(item, isLive);
       } else {
         // Update only if content signature changed (cheap: score+status+llm_score+reason)
-        const sig = rowSig(item);
+        const sig = rowSig(item, isLive);
         if (node._sig !== sig) {
-          node.innerHTML = buildRowHTML(item);
+          node.innerHTML = buildRowHTML(item, isLive);
           if (item.boss_id) node.setAttribute('data-bossid', item.boss_id);
         }
         node._sig = sig;
@@ -2395,10 +2640,12 @@
       const act = actBtn.getAttribute('data-act');
       const item = state.queuePanel.itemsById.get(mid);
       if (!item) return;
-      if (state.queuePanel.bulkGreetRunning && act !== 'restore') {
+      if (state.queuePanel.bulkGreetRunning && !['restore', 'archive'].includes(act)) {
         showToast('批量打招呼进行中，请稍候', true);
         return;
       }
+      if (act === 'archive') return openCandidateArchive(item);
+      if (act === 'locate') return locateCardOnPage(item, { fallbackToArchive: true });
       if (act === 'skip') return handleStatusChange(item, 'skipped');
       if (act === 'restore') return handleStatusChange(item, 'new');
       return;
@@ -2407,8 +2654,12 @@
     if (!row) return;
     const mid = Number(row.getAttribute('data-mid'));
     const item = state.queuePanel.itemsById.get(mid);
-    if (!item || !item.boss_id) { showToast('该候选人无 boss_id，无法定位', true); return; }
-    locateCardOnPage(item);
+    if (!item) return;
+    if (!item.boss_id) {
+      openCandidateArchive(item, { reason: '该历史记录没有可用于定位 BOSS 卡片的候选人 ID，已为你打开保存的档案。' });
+      return;
+    }
+    locateCardOnPage(item, { fallbackToArchive: true });
   }
 
   // Single place that performs a real send for a queue item — used by both
@@ -2754,8 +3005,10 @@
         return;
       }
       const scored = (res && (res.scored ?? 0));
-      showToast(`AI 精评完成：${scored} 人`);
-      setQueueStatus(`AI 精评完成：${scored} 人`);
+      const skipped = (res && (res.skipped_existing ?? 0));
+      const summary = res?.message || `AI 精评完成：新评 ${scored} 人${skipped ? `，跳过已评 ${skipped} 人` : ''}`;
+      showToast(summary);
+      setQueueStatus(summary);
       await fetchQueue(true);
     } catch (err) {
       setQueueStatus('AI 精评失败: ' + err.message, true);
@@ -2783,6 +3036,17 @@
       if (!started || started.error || started.configured === false) {
         throw new Error((started && started.error) || '无法启动 AI评分任务');
       }
+      const skippedExisting = started.skipped_existing || 0;
+      if (started.completed || !started.task_id) {
+        const summary = started.message || `已有 ${skippedExisting} 人完成 AI 评分，无需重复评分`;
+        showToast(summary);
+        setQueueStatus(summary);
+        await fetchQueue(true);
+        return;
+      }
+      showProgress(0, started.total || 0, skippedExisting
+        ? `待评 ${started.total} 人，已跳过 ${skippedExisting} 人`
+        : '正在准备评分');
 
       while (true) {
         const task = await apiPost(`/llm-rerank-jobs/${encodeURIComponent(started.task_id)}/status`, {});
@@ -2791,7 +3055,7 @@
         setQueueStatus(task.message || '正在评分…', task.status === 'failed');
 
         if (task.status === 'succeeded') {
-          const summary = `AI评分完成：${task.scored}/${task.total} 人`;
+          const summary = `AI评分完成：新评 ${task.scored}/${task.total} 人${skippedExisting ? `，跳过已评 ${skippedExisting} 人` : ''}`;
           showToast(summary);
           setQueueStatus(summary);
           await fetchQueue(true);
@@ -2824,7 +3088,7 @@
       '[class*="geek"][class*="detail"]', '[class*="detail"][class*="dialog"]',
       '[class*="resume"][class*="drawer"]',
     ].join(',');
-    const ownPanels = [document.getElementById('boss-helper-panel'), document.getElementById('boss-helper-queue-panel')];
+    const ownPanels = [document.getElementById('boss-helper-panel'), document.getElementById('boss-helper-queue-panel'), document.getElementById('boss-helper-candidate-archive')];
     for (const doc of getAllDocs()) {
       for (const panel of doc.querySelectorAll(selectors)) {
         if (!isVisibleElement(panel) || ownPanels.some(own => own && own.contains(panel))) continue;
@@ -2863,43 +3127,60 @@
   async function waitForResumeIdentity(item, timeoutMs = 3000) {
     const deadline = Date.now() + timeoutMs;
     let sawPanel = false;
+    let sawDifferentCandidateId = false;
+    const targetId = String(item.boss_id || '');
+    const targetName = String(item.name || '').replace(/[\s·•]/g, '');
     while (Date.now() < deadline) {
       const panels = findOpenResumePanels();
       if (panels.length) {
         sawPanel = true;
         for (const panel of panels) {
           const ids = [...panel.querySelectorAll('[data-expect], [data-geek], [data-geekid]')]
-            .map(el => el.getAttribute('data-expect') || el.getAttribute('data-geek') || el.getAttribute('data-geekid'));
-          if (ids.includes(item.boss_id)) return 'confirmed';
-          if (item.name && (panel.innerText || '').includes(item.name)) return 'confirmed';
+            .map(el => el.getAttribute('data-expect') || el.getAttribute('data-geek') || el.getAttribute('data-geekid'))
+            .filter(Boolean)
+            .map(String);
+          if (targetId && ids.includes(targetId)) return 'confirmed';
+          if (ids.length && targetId && !ids.includes(targetId)) sawDifferentCandidateId = true;
+          const panelText = String(panel.innerText || '').replace(/[\s·•]/g, '');
+          if (targetName && panelText.includes(targetName)) return 'confirmed';
         }
       }
       await sleep(100);
     }
-    return sawPanel ? 'mismatch' : 'unverified';
+    // Absence of an inspectable ID/name is not proof of a mismatch. BOSS often
+    // renders the visible resume inside a nested surface that exposes neither.
+    if (sawDifferentCandidateId) return 'mismatch';
+    return sawPanel ? 'opened_unverified' : 'unverified';
   }
 
   let resumeOpenInFlight = false;
 
   // Open exactly one verified resume from a live card. This prevents both
   // stacked BOSS modals and stale virtual-list references opening another user.
-  async function locateCardOnPage(item) {
+  async function locateCardOnPage(item, options = {}) {
     if (resumeOpenInFlight) {
       showToast('正在打开上一份简历，请稍候', true);
       return;
     }
     resumeOpenInFlight = true;
     try {
+      const target = findCardByBossId(item.boss_id);
+      if (!target || getCardCandidateId(target) !== item.boss_id) {
+        if (options.fallbackToArchive) {
+          const reason = '当前页面没有该候选人的真实卡片，因此暂时不能打招呼。已展示最近一次保存的候选人档案。';
+          setQueueStatus(`当前页未找到 ${item.name || '该候选人'}，已打开档案`);
+          openCandidateArchive(item, { reason });
+          showToast('当前页没有该候选人，已打开档案');
+        } else {
+          setQueueStatus('未找到与队列记录一致的当前卡片，未执行打开操作', true);
+          showToast('未找到与队列记录一致的当前卡片', true);
+        }
+        return false;
+      }
       if (!await closeOpenResumePanels()) {
         setQueueStatus('未能自动关闭已有简历，请先关闭后再试', true);
         showToast('未能自动关闭已有简历，请先关闭后再试', true);
-        return;
-      }
-      const target = findCardByBossId(item.boss_id);
-      if (!target || getCardCandidateId(target) !== item.boss_id) {
-        setQueueStatus('未找到与队列记录一致的当前卡片，未执行打开操作', true);
-        showToast('未找到与队列记录一致的当前卡片', true);
-        return;
+        return false;
       }
       try { target.scrollIntoView({ behavior: 'smooth', block: 'center' }); } catch {}
       target.classList.add('bhq-located');
@@ -2907,19 +3188,26 @@
       if (!openCardChat(target)) {
         setQueueStatus('未找到该候选人的简历入口', true);
         showToast('未找到该候选人的简历入口', true);
-        return;
+        return false;
       }
       const result = await waitForResumeIdentity(item);
       if (result === 'confirmed') {
         setQueueStatus(`已定位并打开简历：${item.name || ''}`);
-        return;
+        return true;
       }
-      if (result === 'mismatch') await closeOpenResumePanels();
-      const message = result === 'mismatch'
-        ? '打开的简历与所选候选人不一致，已自动关闭'
-        : '简历层未出现或无法确认候选人身份，请重试';
-      setQueueStatus(message, true);
-      showToast(message, true);
+      if (result === 'mismatch') {
+        await closeOpenResumePanels();
+        const message = '检测到明确不同的候选人 ID，已自动关闭简历';
+        setQueueStatus(message, true);
+        showToast(message, true);
+        return false;
+      }
+      const message = result === 'opened_unverified'
+        ? `简历已打开：${item.name || ''}（页面未暴露可核验 ID，请人工确认姓名）`
+        : `已执行打开操作：${item.name || ''}（未检测到标准简历弹层，请人工确认）`;
+      setQueueStatus(message);
+      showToast(message);
+      return true;
     } finally {
       resumeOpenInFlight = false;
     }

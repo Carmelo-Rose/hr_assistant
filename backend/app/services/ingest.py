@@ -61,6 +61,8 @@ def upsert_candidate(
             existing.age = parsed_age
         if candidate_dict.get("fullText"):
             existing.experience_summary = candidate_dict.get("fullText", "")
+        if candidate_dict.get("shareUrl"):
+            existing.share_url = candidate_dict["shareUrl"]
         existing.score = score_result["score"]
         if source_keyword:
             existing.source_keyword = source_keyword
@@ -85,6 +87,7 @@ def upsert_candidate(
             expected_city=candidate_dict.get("expectCity", ""),
             major=candidate_dict.get("major", ""),
             score=score_result["score"],
+            share_url=candidate_dict.get("shareUrl", ""),
             source_keyword=source_keyword,
         )
         db.add(candidate)

@@ -234,18 +234,34 @@ def ext_log_greeting(req: ExtLogGreetingRequest, db: Session = Depends(get_db)):
 class ExtRerankRequest(BaseModel):
     job_id: str | None = None
     limit: int = 60  # safety cap on how many candidates to send to the LLM
+    force: bool = False  # explicit opt-in for re-scoring rows that already have an AI score
 
 
-def _rerank_rows(db: Session, job_id: str, limit: int):
-    """Return the same score-ordered shortlist for sync and tracked scoring."""
-    return (
+def _rerank_rows(db: Session, job_id: str, limit: int, include_scored: bool = False):
+    """Return the score-ordered shortlist, skipping existing AI scores by default."""
+    query = (
         db.query(MatchResult, Candidate)
         .join(Candidate, MatchResult.candidate_id == Candidate.id)
         .filter(MatchResult.job_id == job_id)
         .filter(~MatchResult.status.in_(["sent_manual", "skipped"]))
-        .order_by(MatchResult.score.desc())
+    )
+    if not include_scored:
+        query = query.filter(MatchResult.llm_score.is_(None))
+    return (
+        query.order_by(MatchResult.score.desc())
         .limit(max(1, min(limit, 200)))
         .all()
+    )
+
+
+def _already_reranked_count(db: Session, job_id: str) -> int:
+    """Count active queue rows that already have a durable AI score."""
+    return (
+        db.query(MatchResult)
+        .filter(MatchResult.job_id == job_id)
+        .filter(~MatchResult.status.in_(["sent_manual", "skipped"]))
+        .filter(MatchResult.llm_score.is_not(None))
+        .count()
     )
 
 
@@ -284,9 +300,20 @@ def ext_llm_rerank(req: ExtRerankRequest, db: Session = Depends(get_db)):
         return {"configured": True, "error": "无岗位配置", "scored": 0}
 
     # 取该岗位下待处理(未发送/未跳过)的候选人,按规则分高→低,限量送评
-    rows = _rerank_rows(db, job.id, req.limit)
+    skipped_existing = 0 if req.force else _already_reranked_count(db, job.id)
+    rows = _rerank_rows(db, job.id, req.limit, include_scored=req.force)
     if not rows:
-        return {"configured": True, "scored": 0, "message": "队列为空,无可精评的候选人"}
+        message = (
+            f"当前岗位已有 {skipped_existing} 人完成 AI 评分，无需重复评分"
+            if skipped_existing
+            else "队列为空,无可精评的候选人"
+        )
+        return {
+            "configured": True,
+            "scored": 0,
+            "skipped_existing": skipped_existing,
+            "message": message,
+        }
 
     briefs = [_candidate_brief(c) for _, c in rows]
     job_desc = llm_scoring.build_job_desc(job)
@@ -311,6 +338,7 @@ def ext_llm_rerank(req: ExtRerankRequest, db: Session = Depends(get_db)):
         "configured": True,
         "scored": updated,
         "total": len(rows),
+        "skipped_existing": skipped_existing,
         "job_title": job.title,
     }
 
@@ -392,9 +420,21 @@ def start_llm_rerank_job(req: ExtRerankRequest, db: Session = Depends(get_db)):
     job = db.query(Job).filter(Job.id == req.job_id).first()
     if job is None:
         return {"configured": True, "error": "岗位不存在"}
-    rows = _rerank_rows(db, job.id, req.limit)
+    skipped_existing = 0 if req.force else _already_reranked_count(db, job.id)
+    rows = _rerank_rows(db, job.id, req.limit, include_scored=req.force)
     if not rows:
-        return {"configured": True, "error": "队列为空，无可评分的候选人"}
+        message = (
+            f"当前岗位已有 {skipped_existing} 人完成 AI 评分，无需重复评分"
+            if skipped_existing
+            else "队列为空，无可评分的候选人"
+        )
+        return {
+            "configured": True,
+            "completed": True,
+            "total": 0,
+            "skipped_existing": skipped_existing,
+            "message": message,
+        }
 
     task = rerank_jobs.create(job_id=job.id, job_title=job.title, total=len(rows))
     snapshot = [(mr.id, candidate.id, _candidate_brief(candidate)) for mr, candidate in rows]
@@ -404,7 +444,13 @@ def start_llm_rerank_job(req: ExtRerankRequest, db: Session = Depends(get_db)):
         name=f"llm-rerank-{task.id[:8]}",
         daemon=True,
     ).start()
-    return {"configured": True, "task_id": task.id, "total": task.total, "job_title": task.job_title}
+    return {
+        "configured": True,
+        "task_id": task.id,
+        "total": task.total,
+        "skipped_existing": skipped_existing,
+        "job_title": task.job_title,
+    }
 
 
 @router.get("/llm-rerank-jobs/{task_id}")

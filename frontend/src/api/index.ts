@@ -30,6 +30,16 @@ export interface QueueItem {
   job_status: string;
   expected_city: string;
   skills: string;
+  company: string;
+  title: string;
+  school: string;
+  major: string;
+  experience_summary: string;
+  raw_snapshot: string;
+  source_keyword: string;
+  share_url: string;
+  created_at: string | null;
+  updated_at: string | null;
 }
 
 export interface Job {
@@ -147,6 +157,7 @@ export interface LlmRerankResult {
   configured: boolean;
   scored?: number;
   total?: number;
+  skipped_existing?: number;
   job_title?: string;
   message?: string;
   error?: string;
