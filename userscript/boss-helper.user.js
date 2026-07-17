@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         BOSS 招聘助手 — 油猴版
+// @name         招聘助手 — 油猴版
 // @namespace    https://github.com/hr_assistant
-// @version      1.22.1
+// @version      1.24.1
 // @description  在 BOSS 直聘页面内扫描候选人、评分、队列复盘、辅助话术
 // @match        https://www.zhipin.com/*
 // @noframes
@@ -44,28 +44,37 @@
   // Root API (without /ext prefix) — used by the in-panel queue view for
   // /queue/today, /outreach/*. Old BACKEND stays for the scan/greet flow.
   const BACKEND_ROOT = `${BACKEND_ORIGIN}/api`;
+  // Business dates and displayed timestamps follow the production service
+  // clock (192.168.1.198, China Standard Time), not the browser timezone.
+  const SERVER_TIME_ZONE = 'Asia/Shanghai';
+  function getServerDateKey(date = new Date()) {
+    const parts = new Intl.DateTimeFormat('en-CA', {
+      timeZone: SERVER_TIME_ZONE,
+      year: 'numeric', month: '2-digit', day: '2-digit',
+    }).formatToParts(date);
+    const value = Object.fromEntries(parts.map(part => [part.type, part.value]));
+    return `${value.year}-${value.month}-${value.day}`;
+  }
   // `li.card-item` = 新版推荐/沟通页卡片（2026-07 起）；`li.geek-info-card` = 旧版人才库搜索页卡片。
   // 两个选择器并存，哪个页面用哪套 DOM 就匹配哪个。
   const CARD_SEL = 'li.card-item, li.geek-info-card';
+  const PENDING_QUEUE_STATUSES = new Set(['new', 'queued', 'drafted', 'filled']);
+  const COMPLETED_QUEUE_STATUSES = new Set(['sent_manual', 'sent_auto']);
 
   // ─── State ────────────────────────────────────────────────────────
   const state = {
     scanned: [],       // [{expectId, name, score, is_blocked, details, draft, cardEl}]
-    mode: 'semi',      // legacy: 'semi' | 'auto'
     jobId: '',         // selected workbench job id (scoring profile)
     jobs: [],          // [{id, title}]
     jobConfigMode: 'edit', // 'edit' | 'create'
     llmEnabled: false, // backend has LLM configured → personalize greetings
     threshold: 70,
     dailyCap: 150,
-    delayMin: 5,
-    delayMax: 15,
     greetingCount: 0,
-    autoRunning: false,
     multiPage: true,      // auto-scroll to load more before scoring
     maxCandidates: 50,    // stop auto-loading after roughly this many cards
     configLoaded: false,
-    todayKey: new Date().toISOString().slice(0, 10),
+    todayKey: getServerDateKey(),
   };
 
   // Restore daily counter
@@ -183,13 +192,23 @@
   function apiPostRoot(path, body, opts) { return _rootRequest('POST', path, body || {}, opts); }
   function apiPatchRoot(path, body, opts) { return _rootRequest('PATCH', path, body || {}, opts); }
 
-  function randDelay() {
-    return Math.floor(Math.random() * (state.delayMax - state.delayMin + 1) + state.delayMin) * 1000;
-  }
-
   function incrCounter() {
     state.greetingCount++;
     GM_setValue('boss_count', state.greetingCount);
+    updateDailyProgress();
+  }
+
+  function decrCounter() {
+    state.greetingCount = Math.max(0, state.greetingCount - 1);
+    GM_setValue('boss_count', state.greetingCount);
+    updateDailyProgress();
+  }
+
+  function updateDailyProgress() {
+    const countEl = document.getElementById('bh-count');
+    if (countEl) countEl.textContent = state.greetingCount;
+    const capEl = document.getElementById('bh-cap');
+    if (capEl) capEl.textContent = state.dailyCap;
   }
 
   // ─── Helpers: collect all accessible documents (main + same-origin iframes,
@@ -606,75 +625,6 @@
   // panel-like container across all accessible documents, and copies it to
   // the clipboard so the actual selector mismatch can be identified without
   // opening DevTools (which BOSS's anti-debug bounces to about:blank).
-  function dumpChatInputDiag() {
-    const ourPanels = [document.getElementById('boss-helper-panel'), document.getElementById('boss-helper-queue-panel'), document.getElementById('boss-helper-candidate-archive')];
-    const inputs = [];
-    const panels = [];
-    const iframes = [];
-    const greetBtns = [];
-    const greetRe = /^(打招呼|立即沟通|继续沟通|去沟通|沟通|联系Ta|联系TA|发送|发 送)$/;
-    getAllDocs().forEach((doc, di) => {
-      // All inputs — hidden ones too (an inline greeting box is often hidden
-      // until you click 打招呼, so filtering hidden would erase the clue).
-      doc.querySelectorAll('textarea, [contenteditable="true"], input[type="text"], input:not([type])').forEach(el => {
-        if (ourPanels.some(p => p && p.contains(el))) return;
-        inputs.push({
-          doc: di,
-          tag: el.tagName.toLowerCase(),
-          visible: el.offsetParent !== null,
-          class: el.getAttribute('class') || '',
-          placeholder: el.getAttribute('placeholder') || '',
-          parentClass: el.parentElement ? (el.parentElement.getAttribute('class') || '') : '',
-        });
-      });
-      doc.querySelectorAll('[class*="dialog"],[class*="modal"],[class*="popup"],[class*="drawer"],[class*="chat"],[class*="im-"],[class*="resume"]').forEach(el => {
-        if (ourPanels.some(p => p && p.contains(el))) return;
-        if (el.offsetParent === null) return;
-        panels.push(`doc${di} | ${el.tagName.toLowerCase()} | class="${el.getAttribute('class') || ''}"`);
-      });
-      // Greet / send buttons by visible text — tells us what to click to
-      // reveal the input (or to send) on this particular BOSS page layout.
-      doc.querySelectorAll('button,a,span,div').forEach(el => {
-        if (ourPanels.some(p => p && p.contains(el))) return;
-        if (el.children.length !== 0 && !el.matches('button,a,[role="button"]')) return;
-        if (!greetRe.test((el.textContent || '').trim())) return;
-        if (el.offsetParent === null) return;
-        greetBtns.push(`doc${di} | ${el.tagName.toLowerCase()} | text="${el.textContent.trim()}" | class="${el.getAttribute('class') || ''}" | parentClass="${el.parentElement ? (el.parentElement.getAttribute('class') || '') : ''}"`);
-      });
-      // Every iframe in this doc, with src + whether contentDocument is
-      // reachable — pinpoints cross-origin (Same-Origin Policy blocks us
-      // structurally, no selector fix possible) vs. same-origin-but-missed.
-      doc.querySelectorAll('iframe').forEach(f => {
-        let accessible = false, reason = '';
-        try {
-          accessible = !!f.contentDocument;
-          if (accessible) reason = `readyState=${f.contentDocument.readyState}, bodyChildren=${f.contentDocument.body ? f.contentDocument.body.children.length : 'n/a'}`;
-        } catch (err) {
-          reason = 'blocked: ' + err.message;
-        }
-        iframes.push({
-          inDoc: di,
-          class: f.getAttribute('class') || '',
-          src: f.getAttribute('src') || '(no src attr)',
-          accessible,
-          reason,
-        });
-      });
-    });
-    // Stamp the ACTUALLY-loaded script version so there's no ambiguity about
-    // whether Tampermonkey picked up the latest edit.
-    let scriptVersion = '?';
-    try { scriptVersion = (GM_info && GM_info.script && GM_info.script.version) || '?'; } catch {}
-    const report = { scriptVersion, url: location.href, docCount: getAllDocs().length, inputs, greetBtns: greetBtns.slice(0, 20), panels: panels.slice(0, 20), iframes };
-    const text = 'BOSS-INPUT-DIAG\n' + JSON.stringify(report, null, 2);
-    try { GM_setClipboard(text); } catch {}
-    return text;
-  }
-
-  // Resolve a queue item's boss_id to a card that is live RIGHT NOW. BOSS's
-  // virtual list can reuse a connected DOM node for a different candidate, so
-  // a cached card reference is never trusted unless its current data-* ID also
-  // matches. Prefer a fresh DOM scan to avoid opening the wrong resume.
   function findCardByBossId(bossId) {
     if (!bossId) return null;
     for (const doc of getAllDocs()) {
@@ -730,26 +680,6 @@
   }
 
   // Wait until the card list changes (next page rendered) or timeout.
-  async function waitForPageChange(prevFirstId, maxMs = 8000) {
-    const doc = getCardDoc();
-    if (!doc) return false;
-    const firstId = () => {
-      const firstCard = doc.querySelector(CARD_SEL);
-      const idEl = firstCard ? getGeekIdEl(firstCard) : null;
-      if (idEl) return idEl.getAttribute('data-expect') || idEl.getAttribute('data-geek') || idEl.getAttribute('data-geekid');
-      return doc.querySelectorAll(CARD_SEL).length;
-    };
-    const start = Date.now();
-    while (Date.now() - start < maxMs) {
-      await sleep(400);
-      if (firstId() !== prevFirstId) return true;
-    }
-    return false;
-  }
-
-  // ─── Infinite scroll: the talent list lazy-appends cards as you scroll ───
-  // Find the actual scrollable container (an inner div, NOT the iframe doc) by
-  // walking up from a card to the first overflow:auto/scroll ancestor.
   function scrollableAncestor(el) {
     if (!el) return null;
     const win = el.ownerDocument.defaultView || window;
@@ -857,15 +787,6 @@
 
   // Poll for a chat input to appear (BOSS renders the greet compose box async
   // after the 打招呼 button is clicked). Returns the element or null.
-  async function waitForChatInput(maxMs) {
-    const start = Date.now();
-    while (Date.now() - start < maxMs) {
-      const el = findChatInputEl();
-      if (el) return el;
-      await sleep(300);
-    }
-    return null;
-  }
 
   function fillInputEl(el, text) {
     const tag = el.tagName.toLowerCase();
@@ -891,100 +812,6 @@
 
   // Find a visible send button across all docs — class-based first, then an
   // exact 发送 text leaf (the greeting dialog's confirm button).
-  function findSendButton() {
-    for (const doc of getAllDocs()) {
-      const byClass = doc.querySelector('button[class*="send"]:not([disabled]), [class*="btn-send"]');
-      if (byClass && byClass.offsetParent !== null) return byClass;
-      for (const el of doc.querySelectorAll('button,a,span,div')) {
-        if (el.children.length !== 0) continue;
-        if (el.offsetParent === null) continue;
-        if (/^(发\s*送)$/.test((el.textContent || '').trim())) return el;
-      }
-    }
-    return null;
-  }
-
-  // Click a "打招呼" button anywhere (used after openCardChat opens the resume
-  // panel, whose greet button lives in the c-resume iframe). Tight regex
-  // (^打招呼$) so it never matches the sidebar 沟通 menu item.
-  function clickGreetButtonAnywhere() {
-    const ourPanels = [document.getElementById('boss-helper-panel'), document.getElementById('boss-helper-queue-panel'), document.getElementById('boss-helper-candidate-archive')];
-    for (const doc of getAllDocs()) {
-      for (const sel of ['button.btn-greet', 'button.btn-getcontact', 'button[class*="getcontact"]', 'a.btn-greet', 'a[class*="greet"]', 'button[class*="greet"]']) {
-        const btn = doc.querySelector(sel);
-        if (btn && btn.offsetParent !== null && !ourPanels.some(p => p && p.contains(btn))) { btn.click(); return true; }
-      }
-      for (const el of doc.querySelectorAll('button,a,span,div')) {
-        if (el.children.length !== 0) continue;
-        if (ourPanels.some(p => p && p.contains(el))) continue;
-        if (isGreetAction(el)) { el.click(); return true; }
-      }
-    }
-    return false;
-  }
-
-  // Trigger BOSS's greet flow for a card: prefer the card's own greet button;
-  // if the card has none (hover-only / new layout), open the resume panel and
-  // click its greet button. Returns true if a greet action was triggered.
-  async function triggerGreetUI(cardEl) {
-    if (clickGreetBtn(cardEl)) return true;
-    // The action bar can be hover-revealed in the virtualized card list.
-    cardEl.dispatchEvent(new MouseEvent('mouseover', { bubbles: true, view: cardEl.ownerDocument.defaultView }));
-    cardEl.dispatchEvent(new MouseEvent('mouseenter', { bubbles: false, view: cardEl.ownerDocument.defaultView }));
-    await sleep(200);
-    if (clickGreetBtn(cardEl)) return true;
-    if (!openCardChat(cardEl)) return false;
-    // The resume panel is rendered asynchronously, often inside a nested
-    // same-origin iframe. Poll rather than taking a single timing snapshot.
-    for (let attempt = 0; attempt < 12; attempt++) {
-      await sleep(500);
-      if (clickGreetButtonAnywhere()) return true;
-    }
-    return false;
-  }
-
-  // ─── Click "打招呼" button on a card ──────────────────────────────
-  function clickGreetBtn(cardEl) {
-    // Try common BOSS greet button selectors
-    const greetBtnSelectors = [
-      'button.btn-greet',              // chat/recommend card action (2026-07)
-      'button.btn-getcontact',         // 人才库搜索页"联系Ta"按钮（当前 BOSS DOM）
-      'button[class*="getcontact"]',
-      'a.btn-greet',                   // 推荐/搜索页卡片上的招呼按钮
-      'a[class*="greet"]',
-      'button[class*="greet"]',
-      'a[data-contact]',               // card link that opens chat
-    ];
-    for (const sel of greetBtnSelectors) {
-      const btn = cardEl.querySelector(sel);
-      if (btn && isVisibleElement(btn)) {
-        btn.click();
-        return true;
-      }
-    }
-    const actionControl = findCardGreetControl(cardEl);
-    if (actionControl) {
-      actionControl.click();
-      return true;
-    }
-    // New chat/recommend cards put the action in `.button-list` and may use
-    // the generic "沟通" label instead of exposing a stable class name.
-    for (const el of cardEl.querySelectorAll('button,a,span,div')) {
-      if (el.children.length === 0 && isGreetAction(el, 'card')) {
-        el.click();
-        return true;
-      }
-    }
-    return false;
-  }
-
-  // ─── Open a card's chat/profile WITHOUT sending (半自动 fill path) ─────
-  // Old DOM: click the `a[data-contact]` card link. New DOM (li.card-item)
-  // has no such link — best-effort click the candidate's name to open the
-  // detail popup. NOT the avatar: clicking it opens a video/photo preview
-  // lightbox instead (confirmed — a `.name-wrap .name, .avatar` combined
-  // selector matched the avatar first since it sits earlier in the DOM than
-  // the name, and querySelector doesn't prioritize by selector-list order).
   function openCardChat(cardEl) {
     const link = cardEl.querySelector('a[data-contact]');
     if (link) { link.click(); return true; }
@@ -998,71 +825,110 @@
     #boss-helper-panel {
       position: fixed; top: 200px; right: 20px; z-index: 99999;
       width: 352px; background: #fff; border: 1px solid #e7eaff; border-radius: 14px;
-      box-shadow: 0 12px 36px rgba(35, 55, 130, .18); font-family: -apple-system, sans-serif;
+      box-shadow: 0 12px 32px rgba(35, 55, 130, .14); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
       font-size: 13px; color: #24304f; user-select: none;
+      display: flex; flex-direction: column; max-height: calc(100vh - 216px); overflow: hidden;
     }
     #boss-helper-panel.dragging { cursor: move; }
     .bh-header {
       display: flex; align-items: center; justify-content: space-between;
-      padding: 11px 14px; background: linear-gradient(135deg, #536dfe, #4355cc); color: #fff;
-      border-radius: 13px 13px 0 0; cursor: move;
+      min-height: 44px; box-sizing: border-box; padding: 8px 10px 8px 14px; background: #4f63d8; color: #fff;
+      border-radius: 13px 13px 0 0; cursor: move; flex: 0 0 auto;
     }
-    .bh-header h3 { margin: 0; font-size: 14px; font-weight: 600; cursor: pointer; display: flex; align-items: center; gap: 6px; }
-    .bh-collapse-arrow { display: inline-block; transition: transform 0.15s; font-size: 10px; }
-    .bh-header .bh-close { cursor: pointer; font-size: 18px; line-height: 1; }
-    .bh-body { padding: 10px 14px 12px; }
+    .bh-header-left { display: flex; align-items: center; gap: 7px; min-width: 0; }
+    .bh-header h3 { margin: 0; font-size: 15px; font-weight: 650; letter-spacing: .1px; white-space: nowrap; }
+    .bh-header-actions { display: flex; align-items: center; gap: 4px; }
+    .bh-window-action, .bh-back {
+      width: 30px; height: 28px; padding: 0; border: 0; border-radius: 7px;
+      display: inline-flex; align-items: center; justify-content: center;
+      background: rgba(255,255,255,.12); color: #fff; cursor: pointer;
+    }
+    .bh-window-action img, .bh-back img { width: 15px; height: 15px; display: block; pointer-events: none; }
+    .bh-window-action:hover, .bh-back:hover { background: rgba(255,255,255,.22); }
+    .bh-window-action:focus-visible, .bh-back:focus-visible { outline: 2px solid #fff; outline-offset: 1px; }
+    .bh-back { display: none; }
+    .bh-body {
+      min-height: 0; padding: 12px 14px 12px; overflow-y: auto;
+      overscroll-behavior: contain; scrollbar-gutter: stable;
+    }
+    #boss-helper-panel select {
+      appearance: none; -webkit-appearance: none; outline: none; color-scheme: light;
+      padding-right: 30px !important; cursor: pointer; color: #2e3b66;
+      background-color: #fff;
+      background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1.5 1.5 6 6l4.5-4.5' fill='none' stroke='%23727da3' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+      background-repeat: no-repeat; background-position: right 10px center; background-size: 12px 8px;
+      transition: border-color .15s, background-color .15s;
+    }
+    #boss-helper-panel select:hover { border-color: #aeb8dc !important; background-color: #fbfcff; }
+    #boss-helper-panel select:focus { outline: none; border-color: #7083e7 !important; box-shadow: 0 0 0 2px rgba(79,99,216,.12) !important; }
+    #boss-helper-panel select option { background: #fff; color: #24304f; }
     #boss-helper-panel.bh-collapsed .bh-body { display: none; }
-    #boss-helper-panel.bh-collapsed .bh-collapse-arrow { transform: rotate(-90deg); }
     #boss-helper-panel.bh-collapsed .bh-header { border-radius: 12px; }
-    .bh-row { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
-    .bh-row label { min-width: 70px; font-size: 12px; color: #666; }
-    .bh-row input[type=number] { width: 60px; padding: 4px 6px; border: 1px solid #ddd; border-radius: 6px; }
-    .bh-row input[type=range] { width: 120px; }
-    .bh-row select { padding: 4px 6px; border: 1px solid #ddd; border-radius: 6px; }
+    #boss-helper-panel.bh-queue-mode { height: 620px; }
+    #boss-helper-panel.bh-queue-mode .bh-main-view { display: none; }
+    #boss-helper-panel.bh-queue-mode .bh-back { display: inline-flex; }
+    #boss-helper-panel.bh-queue-mode .bh-collapse-action { display: none; }
+    .bh-row { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+    .bh-row > label:first-child { flex: 0 0 70px; font-size: 12px; color: #66708b; }
+    .bh-row input[type=number] { width: 60px; height: 34px; box-sizing: border-box; padding: 5px 7px; border: 1px solid #dce1f0; border-radius: 8px; background: #fff; }
+    .bh-row input[type=range] { flex: 1; min-width: 0; }
+    .bh-row select { height: 34px; padding: 5px 8px; border: 1px solid #dce1f0; border-radius: 8px; }
+    .bh-row input:focus-visible, .bh-btn:focus-visible, .bh-icon-btn:focus-visible {
+      outline: 2px solid rgba(79,99,216,.32); outline-offset: 2px;
+    }
     .bh-icon-btn {
-      width: 30px; height: 28px; display: inline-flex; align-items: center; justify-content: center;
-      border: 1px solid #ddd; border-radius: 7px; background: #fff; color: #555; cursor: pointer;
-      font-size: 13px;
+      width: 44px; height: 34px; display: inline-flex; align-items: center; justify-content: center;
+      border: 1px solid #dce1f0; border-radius: 8px; background: #f8f9fd; color: #596684; cursor: pointer;
+      font-size: 11px; font-weight: 600;
     }
     .bh-icon-btn:hover { border-color: #4f6ef7; color: #4f6ef7; }
     .bh-job-config {
-      display: none; margin: 8px 0 10px; padding: 10px; border: 1px solid #e6e8ef;
-      border-radius: 8px; background: #fafbff; user-select: text;
+      display: none; margin: 10px -2px 12px; padding: 12px; border: 1px solid #e1e6f5;
+      border-radius: 12px; background: linear-gradient(180deg, #fbfcff 0%, #f7f9ff 100%);
+      box-shadow: 0 5px 18px rgba(56, 73, 145, .07); user-select: text;
     }
     .bh-job-config.open { display: block; }
-    .bh-job-config-head { display: flex; gap: 6px; margin-bottom: 9px; }
+    .bh-job-config-head { display: flex; gap: 3px; margin-bottom: 12px; padding: 3px; border-radius: 9px; background: #edf0f8; }
     .bh-job-mode-btn {
-      flex: 1; padding: 5px 8px; border: 1px solid #d9dce6; border-radius: 7px;
-      background: #fff; color: #555; font-size: 12px; cursor: pointer;
+      flex: 1; padding: 7px 8px; border: 0; border-radius: 7px;
+      background: transparent; color: #69738c; font-size: 12px; cursor: pointer;
     }
-    .bh-job-mode-btn.active { border-color: #4f6ef7; background: #eef2ff; color: #3455dc; font-weight: 600; }
-    .bh-job-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+    .bh-job-mode-btn.active { background: #fff; color: #3f56cb; font-weight: 700; box-shadow: 0 2px 7px rgba(54,70,135,.12); }
+    .bh-job-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 9px; }
     .bh-job-field.full { grid-column: 1 / -1; }
-    .bh-job-field label { display: block; margin-bottom: 3px; font-size: 11px; color: #666; }
+    .bh-job-subtitle { grid-column: 1 / -1; display: flex; align-items: center; gap: 7px; margin: 2px 0 -1px; color: #3d4969; font-size: 11px; font-weight: 700; }
+    .bh-job-subtitle::after { content: ''; flex: 1; height: 1px; background: #e4e8f3; }
+    .bh-job-field label { display: block; margin-bottom: 5px; font-size: 11px; color: #6e7891; }
     .bh-job-field input,
     .bh-job-field select {
-      width: 100%; box-sizing: border-box; padding: 5px 7px; border: 1px solid #d9dce6;
-      border-radius: 6px; background: #fff; font-size: 12px;
+      width: 100%; height: 35px; box-sizing: border-box; padding: 6px 9px; border: 1px solid #dce1ef;
+      border-radius: 8px; background: #fff; color: #2f3b5a; font-size: 12px; transition: border-color .15s, background .15s;
     }
-    .bh-job-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 10px; }
-    .bh-job-hint { margin-top: 7px; font-size: 11px; color: #888; line-height: 1.4; }
+    .bh-job-field input:hover { border-color: #b8c1df; }
+    .bh-job-field input:focus { outline: none; border-color: #7f8fd1; background: #fff; box-shadow: 0 0 0 2px rgba(79,110,247,.08); }
+    .bh-job-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 13px; padding-top: 11px; border-top: 1px solid #e6e9f3; }
+    .bh-job-hint { margin-top: 8px; padding: 7px 9px; border-radius: 7px; background: #f0f3fb; font-size: 10px; color: #74809b; line-height: 1.5; }
     .bh-btn {
-      display: inline-block; padding: 7px 13px; border-radius: 8px;
+      display: inline-block; min-height: 38px; padding: 8px 13px; border-radius: 9px;
       font-size: 12px; cursor: pointer; border: none; font-weight: 600;
     }
-    .bh-btn-primary { background: #4f6ef7; color: #fff; }
+    .bh-btn-primary { background: #4f63d8; color: #fff; box-shadow: 0 2px 6px rgba(67,85,204,.14); }
+    .bh-btn-primary:hover { background: #4357cb; }
     .bh-btn-danger { background: #e74c3c; color: #fff; }
-    .bh-btn-secondary { background: #f0f0f0; color: #333; }
-    .bh-stats { display: flex; align-items: center; justify-content: space-between; font-size: 12px; color: #66708b; margin-bottom: 9px; }
-    .bh-stats b { color: #4355cc; }
-    .bh-section { padding: 0; margin-bottom: 8px; border: 0; border-radius: 0; background: transparent; }
-    .bh-section-title { display: none; }
+    .bh-btn-secondary { background: #eef1f7; color: #46506a; }
+    .bh-daily-summary { margin-bottom: 14px; }
+    .bh-stats { display: flex; align-items: center; justify-content: space-between; font-size: 12px; color: #66708b; }
+    .bh-stats strong { color: #3649bd; font-size: 13px; font-variant-numeric: tabular-nums; }
+    .bh-section { padding: 0; margin-bottom: 14px; border: 0; border-radius: 0; background: transparent; }
+    .bh-section-title { display: block; margin: 0 0 9px; color: #3f4965; font-size: 11px; font-weight: 700; letter-spacing: .4px; }
     .bh-section .bh-row:last-child { margin-bottom: 0; }
-    .bh-action-row { display: flex; align-items: center; gap: 8px; margin-top: 3px; }
+    .bh-inline-note { font-size: 11px; color: #7b849b; white-space: nowrap; }
+    .bh-max-label { margin-left: 28px; }
+    .bh-action-row { display: flex; align-items: center; gap: 9px; margin-top: 2px; }
     #bh-scan { flex: 1.25; }
     #bh-open-queue { flex: 1; }
-    #bh-diag { padding: 7px 4px; background: transparent; color: #7b849b; }
-    .bh-status { min-height: 14px; margin-top: 8px; font-size: 11px; color: #7b849b; }
+    #bh-diag { margin-right: auto; }
+    .bh-status { min-height: 16px; margin-top: 10px; padding-top: 9px; border-top: 1px solid #edf0f7; font-size: 11px; color: #747e97; }
     .bh-status.err { color: #e74c3c; }
     .bh-badge {
       position: absolute; top: 6px; right: 40px;
@@ -1080,63 +946,61 @@
     .bh-card-score.blocked { background: #343a40; color: #fff; }
     .bh-card-score.contacted { background: #e2e3e5; color: #6c757d; }
 
-    /* ─── Queue panel ─────────────────────────────────────────────── */
+    /* ─── Queue view: lives inside the assistant window ──────────── */
     #boss-helper-queue-panel {
-      position: fixed; top: 200px; right: 372px; z-index: 99998;
-      width: min(780px, calc(100vw - 64px)); max-height: 82vh;
-      display: none; flex-direction: column;
-      background: #fff; border: 1px solid #e7eaff; border-radius: 14px;
-      box-shadow: 0 14px 40px rgba(35, 55, 130, .20);
-      font-family: -apple-system, sans-serif; font-size: 13px; color: #24304f;
+      display: none; flex: 1; min-height: 0; flex-direction: column; overflow: hidden; background: #fff;
     }
-    #boss-helper-queue-panel.bhq-stacked {
-      right: 20px; width: 340px;
-    }
-    .bhq-header {
-      display: flex; align-items: center; gap: 8px;
-      padding: 11px 14px; background: linear-gradient(135deg, #536dfe, #4355cc); color: #fff;
-      border-radius: 13px 13px 0 0; cursor: move; user-select: none;
-    }
-    .bhq-header h3 { margin: 0; font-size: 14px; font-weight: 600; flex: 0 0 auto; }
-    .bhq-tabs { display: flex; gap: 4px; margin-left: 10px; }
+    #boss-helper-panel.bh-queue-mode #boss-helper-queue-panel { display: flex; }
+    .bhq-nav { display: flex; align-items: center; gap: 6px; padding: 9px 10px; border-bottom: 1px solid #edf0f7; }
+    .bhq-tabs { display: flex; gap: 5px; }
     .bhq-tab {
-      padding: 3px 10px; border-radius: 12px; font-size: 12px;
-      cursor: pointer; background: rgba(255,255,255,0.15); color: #fff;
+      border: 0; padding: 5px 10px; border-radius: 14px; font-size: 12px;
+      cursor: pointer; background: #eef1fb; color: #66708b;
     }
-    .bhq-tab.active { background: #fff; color: #4f6ef7; font-weight: 600; }
-    .bhq-header-spacer { flex: 1; }
+    .bhq-tab.active { background: #4f6ef7; color: #fff; font-weight: 600; }
+    .bhq-tab-count { margin-left: 3px; }
+    .bhq-nav-spacer { flex: 1; }
     .bhq-header-btn {
-      cursor: pointer; padding: 3px 8px; border-radius: 6px;
-      background: rgba(255,255,255,0.15); font-size: 12px;
+      cursor: pointer; border: 0; padding: 4px 8px; border-radius: 6px;
+      background: #eef1fb; color: #4355cc; font-size: 13px;
     }
-    .bhq-header-btn:hover { background: rgba(255,255,255,0.28); }
-    .bhq-close { cursor: pointer; font-size: 18px; line-height: 1; margin-left: 4px; }
+    .bhq-header-btn:hover { background: #e0e6ff; }
 
     .bhq-toolbar {
-      display: flex; align-items: center; gap: 8px;
-      padding: 9px 14px; border-bottom: 1px solid #edf0f7;
+      display: flex; align-items: center; gap: 7px;
+      padding: 8px 10px; border-bottom: 1px solid #edf0f7;
       background: #fafbff; flex-wrap: wrap;
     }
     .bhq-toolbar-status { display: none; }
     .bhq-toolbar-status.err { color: #e74c3c; }
-    .bhq-filter { display: flex; align-items: center; gap: 4px; font-size: 11px; color: #666; white-space: nowrap; }
-    .bhq-filter select {
-      max-width: 160px; padding: 3px 22px 3px 6px; border: 1px solid #d9def5;
-      border-radius: 6px; background: #fff; color: #35469d; font-size: 11px;
+    .bhq-filter {
+      display: flex; align-items: center; min-width: 0; height: 34px;
+      border: 1px solid #d9def5; border-radius: 8px; background: #fff;
+      box-shadow: 0 1px 2px rgba(55, 72, 150, .05); white-space: nowrap;
+      transition: border-color .15s, box-shadow .15s;
     }
-    #bhq-bulk-skip { margin-left: auto; }
-
+    .bhq-filter:focus-within { border-color: #aeb8dc; box-shadow: none; }
+    .bhq-filter-label { padding: 0 9px; color: #7b8499; font-size: 11px; }
+    .bhq-filter select {
+      width: 174px; min-width: 110px; height: 32px;
+      padding: 0 30px 0 10px; border: 0; border-left: 1px solid #edf0f7;
+      border-radius: 0 8px 8px 0; outline: none; cursor: pointer;
+      background-color: #fff; color: #35469d; font-size: 12px; font-weight: 600;
+    }
     .bhq-list {
-      flex: 1; overflow-y: auto; padding: 10px;
+      flex: 1; overflow-y: auto; padding: 8px;
       min-height: 120px; background: #f7f8fd;
     }
     .bhq-empty { padding: 40px 20px; text-align: center; color: #8a93a9; font-size: 12px; }
     .bhq-row {
       display: flex; gap: 10px; align-items: flex-start;
       padding: 11px 12px; margin-bottom: 8px; border: 1px solid #e9ecf5; border-radius: 10px;
-      background: #fff; cursor: pointer; transition: background .12s, border-color .12s, box-shadow .12s;
+      background: #fff; cursor: default; transition: background .12s, border-color .12s, box-shadow .12s;
     }
-    .bhq-row:hover { border-color: #cfd7ff; background: #fff; box-shadow: 0 4px 12px rgba(63, 79, 160, .08); }
+    .bhq-row.is-actionable { cursor: pointer; }
+    .bhq-row.is-actionable:hover { border-color: #aebaff; background: #fafbff; box-shadow: 0 4px 12px rgba(63, 79, 160, .08); }
+    .bhq-row.is-actionable:focus-visible { outline: 3px solid rgba(79,110,247,.25); outline-offset: 1px; }
+    .bhq-row.is-active { border-color: #7589ff; background: #f2f5ff; box-shadow: inset 3px 0 #4f6ef7; }
     .bhq-row-main { flex: 1; min-width: 0; }
     .bhq-row-actions { flex: 0 0 auto; display: flex; gap: 4px; align-items: center; }
     .bhq-name-line { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
@@ -1152,7 +1016,6 @@
       font-size: 10px; font-weight: 700; line-height: 1.5;
     }
     .bhq-presence.live { color: #167144; background: #e6f7ed; }
-    .bhq-presence.history { color: #956000; background: #fff4d8; }
     .bhq-badge {
       display: inline-block; padding: 1px 7px; border-radius: 10px;
       font-size: 11px; font-weight: 600; line-height: 1.4;
@@ -1163,16 +1026,6 @@
     .bhq-badge.llm-high { background: #e3e0ff; color: #4b3fbb; }
     .bhq-badge.llm-mid { background: #ede9fe; color: #6b46c1; }
     .bhq-badge.llm-low { background: #ffe1ec; color: #b0345c; }
-    .bhq-status-dot {
-      display: inline-block; width: 7px; height: 7px; border-radius: 50%;
-      background: #bbb; flex-shrink: 0;
-    }
-    .bhq-status-dot.new { background: #6c757d; }
-    .bhq-status-dot.queued { background: #4f6ef7; }
-    .bhq-status-dot.drafted { background: #17a2b8; }
-    .bhq-status-dot.filled { background: #ffc107; }
-    .bhq-status-dot.sent_manual { background: #28a745; }
-    .bhq-status-dot.skipped { background: #dc3545; }
     .bhq-info {
       font-size: 11px; color: #666; margin-top: 3px;
       overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
@@ -1204,6 +1057,18 @@
       transition: width 0.7s cubic-bezier(.22, 1, .36, 1);
     }
     .bhq-progress-text { flex: 0 0 auto; font-size: 11px; color: #666; white-space: nowrap; }
+    .bhq-undo-bar {
+      display: none; align-items: center; gap: 8px; padding: 9px 11px;
+      border-bottom: 1px solid #ccebd7; background: #effaf3; color: #24623b; font-size: 11px;
+    }
+    .bhq-undo-bar.show { display: flex; }
+    .bhq-undo-message { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .bhq-undo-count { color: #62806c; font-variant-numeric: tabular-nums; }
+    .bhq-undo-btn {
+      flex: 0 0 auto; border: 1px solid #8ccba3; border-radius: 7px; padding: 4px 9px;
+      background: #fff; color: #18733a; font-size: 11px; font-weight: 700; cursor: pointer;
+    }
+    .bhq-undo-btn:hover { background: #e0f6e8; }
 
     .bhq-toast {
       position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
@@ -1213,6 +1078,8 @@
     }
     .bhq-toast.show { opacity: 1; }
     .bhq-toast.err { background: rgba(200, 30, 30, 0.9); }
+    .bhq-toast.undo { pointer-events: auto; display: flex; align-items: center; gap: 10px; }
+    .bhq-toast button { border: 0; border-radius: 4px; padding: 3px 8px; color: #273889; background: #fff; font-weight: 700; cursor: pointer; }
 
     /* Locate-on-page highlight (applied to a BOSS card temporarily) */
     .bhq-located {
@@ -1221,68 +1088,16 @@
       transition: outline 0.15s;
     }
 
-    /* Candidate archive drawer: a read-only fallback when the real BOSS card
-       is no longer rendered. It never impersonates BOSS's native resume UI. */
-    .bh-archive-backdrop {
-      position: fixed; inset: 0; z-index: 100002;
-      background: rgba(20, 28, 56, .28); backdrop-filter: blur(1px);
-    }
-    #boss-helper-candidate-archive {
-      position: fixed; top: 0; right: 0; bottom: 0; z-index: 100003;
-      width: min(440px, 96vw); display: flex; flex-direction: column;
-      background: #f7f8fd; color: #24304f;
-      box-shadow: -16px 0 48px rgba(22, 35, 90, .22);
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      animation: bhArchiveIn .18s ease-out;
-    }
-    @keyframes bhArchiveIn { from { transform: translateX(24px); opacity: .5; } to { transform: translateX(0); opacity: 1; } }
-    .bh-archive-header {
-      display: flex; align-items: center; gap: 10px; padding: 16px 18px;
-      color: #fff; background: linear-gradient(135deg, #536dfe, #4355cc);
-    }
-    .bh-archive-header-main { flex: 1; min-width: 0; }
-    .bh-archive-eyebrow { font-size: 11px; opacity: .82; margin-bottom: 2px; }
-    .bh-archive-header h3 { margin: 0; font-size: 17px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .bh-archive-close {
-      width: 30px; height: 30px; border: 0; border-radius: 8px; cursor: pointer;
-      color: #fff; background: rgba(255,255,255,.14); font-size: 22px; line-height: 28px;
-    }
-    .bh-archive-close:hover { background: rgba(255,255,255,.25); }
-    .bh-archive-notice {
-      margin: 14px 16px 0; padding: 10px 12px; border-radius: 9px;
-      font-size: 12px; line-height: 1.55;
-    }
-    .bh-archive-notice.live { color: #176b3a; background: #eaf8ef; border: 1px solid #ccebd8; }
-    .bh-archive-notice.history { color: #805100; background: #fff8e7; border: 1px solid #f3dfaa; }
-    .bh-archive-body { flex: 1; overflow-y: auto; padding: 14px 16px 24px; }
-    .bh-archive-card {
-      margin-bottom: 12px; padding: 14px; background: #fff;
-      border: 1px solid #e8ebf5; border-radius: 11px;
-    }
-    .bh-archive-title { margin: 0 0 10px; color: #29355d; font-size: 12px; font-weight: 700; }
-    .bh-archive-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 14px; }
-    .bh-archive-field { min-width: 0; }
-    .bh-archive-label { display: block; margin-bottom: 3px; color: #8a93a9; font-size: 10px; }
-    .bh-archive-value { color: #303a59; font-size: 12px; line-height: 1.45; overflow-wrap: anywhere; }
-    .bh-archive-scores { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-    .bh-archive-score { padding: 12px; border-radius: 9px; background: #f4f6ff; }
-    .bh-archive-score b { display: block; margin-top: 2px; color: #4055cc; font-size: 22px; }
-    .bh-archive-text { color: #4a536e; font-size: 12px; line-height: 1.7; white-space: pre-wrap; overflow-wrap: anywhere; }
-    .bh-archive-tags { display: flex; flex-wrap: wrap; gap: 6px; }
-    .bh-archive-tag { padding: 3px 8px; border-radius: 999px; color: #4d5eb3; background: #eef1ff; font-size: 11px; }
-    .bh-archive-footer {
-      display: flex; flex-wrap: wrap; gap: 8px; padding: 12px 16px 16px; background: #fff;
-      border-top: 1px solid #e7eaf3;
-    }
-    .bh-archive-btn {
-      min-height: 36px; padding: 8px 13px; border: 0; border-radius: 8px;
-      cursor: pointer; font-size: 12px; font-weight: 700;
-    }
-    .bh-archive-btn.primary { flex: 1; color: #fff; background: #4f6ef7; }
-    .bh-archive-btn.secondary { color: #46506c; background: #edf0f7; }
-    .bh-archive-btn.link { color: #4055cc; background: #eef1ff; }
-    .bh-archive-btn:disabled { cursor: not-allowed; opacity: .48; }
   `);
+
+  // Tabler Icons (MIT), embedded as image assets so the title bar stays self-contained.
+  const HEADER_ICONS = {
+    back: `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="m5 12 6 6"/><path d="m5 12 6-6"/></svg>`,
+    collapse: `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round"><path d="M5 12h14"/></svg>`,
+    expand: `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>`,
+    close: `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>`,
+  };
+  const headerIcon = (name) => `<img alt="" aria-hidden="true" src="data:image/svg+xml,${encodeURIComponent(HEADER_ICONS[name])}">`;
 
   function createPanel() {
     // Prevent duplicate panels (page navigation / re-inject)
@@ -1293,80 +1108,136 @@
     panel.id = 'boss-helper-panel';
     panel.innerHTML = `
       <div class="bh-header">
-        <h3><span class="bh-collapse-arrow">▾</span>BOSS 招聘助手</h3>
-        <span class="bh-close">×</span>
+        <div class="bh-header-left">
+          <button class="bh-back" id="bh-back" type="button" title="返回招聘助手" aria-label="返回招聘助手">${headerIcon('back')}</button>
+          <h3 id="bh-header-title">招聘助手</h3>
+        </div>
+        <div class="bh-header-actions">
+          <button class="bh-window-action bh-collapse-action" id="bh-collapse" type="button" title="收起" aria-label="收起招聘助手" aria-expanded="true" aria-controls="bh-main-body">${headerIcon('collapse')}</button>
+          <button class="bh-window-action bh-close" type="button" title="关闭" aria-label="关闭招聘助手">${headerIcon('close')}</button>
+        </div>
       </div>
-      <div class="bh-body">
-        <div class="bh-stats"><span>今日触达</span><span><b id="bh-count">${state.greetingCount}</b> / <b id="bh-cap">${state.dailyCap}</b></span></div>
+      <div class="bh-body bh-main-view" id="bh-main-body">
+        <div class="bh-daily-summary">
+          <div class="bh-stats"><span>今日触达</span><strong><span id="bh-count">${state.greetingCount}</span> / <span id="bh-cap">${state.dailyCap}</span></strong></div>
+        </div>
         <div class="bh-section">
           <p class="bh-section-title">评分设置</p>
           <div class="bh-row">
-            <label>匹配岗位</label>
+            <label for="bh-job">匹配岗位</label>
             <select id="bh-job" style="flex:1"><option value="">加载中…</option></select>
-            <button class="bh-icon-btn" id="bh-job-config-toggle" title="配置当前岗位">⚙</button>
+            <button class="bh-icon-btn" id="bh-job-config-toggle" type="button" title="配置当前岗位">设置</button>
           </div>
           <div class="bh-row">
-            <label>评分阈值</label>
+            <label for="bh-threshold">评分阈值</label>
             <input type="range" id="bh-threshold" min="0" max="100" value="${state.threshold}">
             <span id="bh-threshold-val">${state.threshold}</span>
           </div>
         </div>
         <div class="bh-job-config" id="bh-job-config"></div>
         <div class="bh-section">
-          <p class="bh-section-title">扫描范围</p>
           <div class="bh-row">
-            <label>自动加载</label>
-            <input type="checkbox" id="bh-multipage" ${state.multiPage ? 'checked' : ''}>
-            <span style="font-size:11px;color:#7b849b">加载上限</span>
+            <label for="bh-multipage">自动加载</label>
+            <input type="checkbox" id="bh-multipage" aria-label="自动加载更多候选人" ${state.multiPage ? 'checked' : ''}>
+            <label class="bh-inline-note bh-max-label" for="bh-maxcand">加载上限</label>
             <input type="number" id="bh-maxcand" value="${state.maxCandidates}" min="15" max="500" step="5" style="width:56px">
-            <span style="font-size:11px;color:#7b849b">人</span>
+            <span class="bh-inline-note">人</span>
           </div>
         </div>
         <div class="bh-action-row">
           <button class="bh-btn bh-btn-primary" id="bh-scan">扫描列表</button>
           <button class="bh-btn bh-btn-secondary" id="bh-open-queue">查看队列</button>
-          <button class="bh-btn bh-btn-secondary" id="bh-diag">诊断</button>
         </div>
-        <div class="bh-status" id="bh-status">就绪</div>
+        <div class="bh-status" id="bh-status" role="status" aria-live="polite">状态：就绪</div>
       </div>
     `;
     document.body.appendChild(panel);
+    panel.addEventListener('change', (event) => {
+      if (event.target?.matches?.('select')) setTimeout(() => event.target.blur(), 0);
+    });
+    const defaultTop = Math.max(16, Math.min(200, window.innerHeight - 320));
+    panel.style.top = defaultTop + 'px';
+    panel.style.maxHeight = Math.max(220, window.innerHeight - defaultTop - 16) + 'px';
+    const fitPanelToViewport = () => {
+      if (!panel.isConnected) return;
+      const currentTop = Number.parseFloat(panel.style.top) || 200;
+      const nextTop = Math.max(8, Math.min(currentTop, window.innerHeight - 220));
+      panel.style.top = nextTop + 'px';
+      panel.style.maxHeight = Math.max(212, window.innerHeight - nextTop - 8) + 'px';
+      const rect = panel.getBoundingClientRect();
+      if (rect.right > window.innerWidth - 8) {
+        panel.style.left = Math.max(8, window.innerWidth - panel.offsetWidth - 8) + 'px';
+        panel.style.right = 'auto';
+      }
+    };
+    window.addEventListener('resize', fitPanelToViewport);
 
     // Drag
     const header = panel.querySelector('.bh-header');
-    let dragging = false, dx = 0, dy = 0, didDrag = false;
-    header.addEventListener('mousedown', (e) => {
+    let dragging = false, dragPointerId = null, dx = 0, dy = 0;
+    const stopDragging = (event) => {
+      if (event?.pointerId != null && dragPointerId != null && event.pointerId !== dragPointerId) return;
+      const capturedPointerId = dragPointerId;
+      dragging = false;
+      dragPointerId = null;
+      panel.classList.remove('dragging');
+      if (capturedPointerId != null && header.hasPointerCapture?.(capturedPointerId)) {
+        header.releasePointerCapture(capturedPointerId);
+      }
+    };
+    header.addEventListener('pointerdown', (e) => {
+      if (e.target.closest('button, .bh-close')) return;
+      if (e.button !== 0) return;
       dragging = true;
-      didDrag = false;
+      dragPointerId = e.pointerId;
       dx = e.clientX - panel.getBoundingClientRect().left;
       dy = e.clientY - panel.getBoundingClientRect().top;
+      header.setPointerCapture(e.pointerId);
       panel.classList.add('dragging');
+      e.preventDefault();
     });
-    document.addEventListener('mousemove', (e) => {
-      if (!dragging) return;
-      didDrag = true;
-      panel.style.left = (e.clientX - dx) + 'px';
-      panel.style.top = (e.clientY - dy) + 'px';
+    header.addEventListener('pointermove', (e) => {
+      if (!dragging || e.pointerId !== dragPointerId) return;
+      const nextLeft = Math.max(8, Math.min(e.clientX - dx, window.innerWidth - panel.offsetWidth - 8));
+      const nextTop = Math.max(8, Math.min(e.clientY - dy, window.innerHeight - header.offsetHeight - 8));
+      panel.style.left = nextLeft + 'px';
+      panel.style.top = nextTop + 'px';
       panel.style.right = 'auto';
+      panel.style.maxHeight = Math.max(header.offsetHeight, window.innerHeight - nextTop - 8) + 'px';
     });
-    document.addEventListener('mouseup', () => { dragging = false; panel.classList.remove('dragging'); });
+    header.addEventListener('pointerup', stopDragging);
+    header.addEventListener('pointercancel', stopDragging);
+    header.addEventListener('lostpointercapture', stopDragging);
+    window.addEventListener('blur', stopDragging);
 
-    // Click title to collapse/expand the body (keeps the header bar visible
-    // so the panel can be tucked away without losing scan state or having to
-    // reload the page, unlike the × which removes it entirely).
-    header.querySelector('h3').addEventListener('click', () => {
-      if (didDrag) { didDrag = false; return; }
-      panel.classList.toggle('bh-collapsed');
+    // Collapse is a dedicated control so it cannot be confused with dragging.
+    const collapseBtn = panel.querySelector('#bh-collapse');
+    collapseBtn.addEventListener('click', () => {
+      if (panel.classList.contains('bh-queue-mode')) return;
+      const collapsed = panel.classList.toggle('bh-collapsed');
+      collapseBtn.innerHTML = headerIcon(collapsed ? 'expand' : 'collapse');
+      collapseBtn.title = collapsed ? '展开' : '收起';
+      collapseBtn.setAttribute('aria-label', collapsed ? '展开招聘助手' : '收起招聘助手');
+      collapseBtn.setAttribute('aria-expanded', String(!collapsed));
     });
 
     // Close
-    panel.querySelector('.bh-close').addEventListener('click', () => panel.remove());
+    panel.querySelector('.bh-close').addEventListener('click', () => {
+      window.removeEventListener('resize', fitPanelToViewport);
+      panel.remove();
+    });
+    panel.querySelector('#bh-back').addEventListener('click', closeQueuePanel);
 
     // Controls
     document.getElementById('bh-job').addEventListener('change', (e) => {
       state.jobId = e.target.value;
       state.jobConfigMode = 'edit';
       renderJobConfig();
+      if (state.queuePanel?.open) {
+        state.queuePanel.jobId = state.jobId;
+        renderQueueJobFilter();
+        fetchQueue(true, true);
+      }
     });
     document.getElementById('bh-job-config-toggle').addEventListener('click', () => {
       const box = document.getElementById('bh-job-config');
@@ -1393,15 +1264,10 @@
     });
 
     document.getElementById('bh-scan').addEventListener('click', doScan);
-    document.getElementById('bh-diag').addEventListener('click', diagnose);
     document.getElementById('bh-open-queue').addEventListener('click', openQueuePanel);
 
     syncAutoLoadControls();
     return panel;
-  }
-
-  function updateAutoButtons() {
-    // Legacy auto-greet buttons were removed from the UI.
   }
 
   function syncAutoLoadControls() {
@@ -1414,7 +1280,7 @@
   function setStatus(msg, err = false) {
     const el = document.getElementById('bh-status');
     if (!el) return;
-    el.textContent = msg;
+    el.textContent = msg === '就绪' ? '状态：就绪' : msg;
     el.className = err ? 'bh-status err' : 'bh-status';
   }
 
@@ -1429,7 +1295,12 @@
       delete copy.cardEl;  // DOM refs can't be JSON-stringified
       return copy;
     });
-    const scored = await apiPost('/score', { candidates: serializable, threshold: state.threshold, job_id: state.jobId });
+    const scored = await apiPost('/score', {
+      candidates: serializable,
+      threshold: state.threshold,
+      job_id: state.jobId,
+      replace_pending: Boolean(state.jobId),
+    });
     const items = scored.map((s, i) => ({
       ...s,
       cardEl: rawCards[i]?.cardEl,
@@ -1447,24 +1318,24 @@
         item.score >= 50 ? 'mid' : 'low'
       );
       badge.textContent = item.already_contacted ? '✓已打'
-        : item.already_skipped ? '⤺已跳过'
         : (item.is_blocked ? '⛔' : item.score);
       badge.title = item.already_contacted ? '该岗位已打过招呼'
-        : item.already_skipped ? '该岗位曾被手动跳过，重扫不会自动回队'
         : (item.is_blocked ? '被排除' : item.details?.join('；') || '');
       item.cardEl.style.position = 'relative';
       item.cardEl.appendChild(badge);
     });
 
-    // 过阈值：未排除、未打招呼、未跳过、达阈值。其中"已跳过"虽过阈值但不回队，单独计。
+    // 过阈值：未排除、未打招呼、达阈值。
     const eligible = items.filter(s => !s.is_blocked && !s.already_contacted && s.score >= state.threshold);
-    const newlyQueued = eligible.filter(s => !s.already_skipped).length;
-    const skipped = eligible.filter(s => s.already_skipped).length;
     const contacted = items.filter(s => s.already_contacted).length;
-    return { found: items.length, passed: newlyQueued, skipped, contacted, scored: items };
+    return { found: items.length, passed: eligible.length, contacted, scored: items };
   }
 
   async function doScan() {
+    if (state.queuePanel?.llmBusy || state.queuePanel?.completionInFlight?.size) {
+      setStatus('当前有 AI 评分或完成标记进行中，请稍后再扫描', true);
+      return;
+    }
     const job = selectedJob();
     if (job) {
       try {
@@ -1483,6 +1354,7 @@
       setStatus('正在扫描卡片...');
     }
     bindBadgeListeners();  // iframe may have loaded after init
+    bindNativeInteractionListeners();
     // Remove old badges (cards live in an iframe, so clear every document)
     getAllDocs().forEach(doc => doc.querySelectorAll('.bh-card-score').forEach(b => b.remove()));
 
@@ -1500,16 +1372,15 @@
       }
 
       // Score everything now in the DOM in one pass (backend upsert is idempotent).
-      const { found, passed, skipped, contacted, scored } = await scoreCurrentPage();
+      const { found, passed, contacted, scored } = await scoreCurrentPage();
       if (!found) {
         setStatus('未找到候选人卡片', true);
         return;
       }
       state.scanned = scored;
-      const skippedNote = skipped ? `，曾跳过 ${skipped} 人(不回队)` : '';
       const contactedNote = contacted ? `，已联系 ${contacted} 人(灰显)` : '';
-      setStatus(`完成：共扫描 ${found} 人，新入队 ${passed} 人${skippedNote}${contactedNote}`);
-      updateAutoButtons();
+      setStatus(`完成：共扫描 ${found} 人，待处理 ${passed} 人${contactedNote}`);
+      if (state.queuePanel?.open) fetchQueue(true, true);
     } catch (err) {
       setStatus('评分请求失败: ' + err.message, true);
     }
@@ -1557,124 +1428,11 @@
   }
 
   // ─── Auto greet loop ──────────────────────────────────────────────
-  let autoTimer = null;
-
-  async function doAutoStart() {
-    if (state.mode !== 'auto') return;
-    if (state.queuePanel.bulkGreetRunning) {
-      setStatus('队列面板批量打招呼进行中，请先停止', true);
-      return;
-    }
-    if (state.greetingCount >= state.dailyCap) {
-      setStatus('已达每日上限', true);
-      return;
-    }
-
-    const candidates = state.scanned.filter(s => !s.is_blocked && !s.already_contacted && !s.already_skipped && s.score >= state.threshold);
-    const skipped = state.scanned.filter(s => s.already_contacted || s.already_skipped).length;
-    if (!candidates.length) {
-      setStatus('无过阈值候选人', true);
-      return;
-    }
-
-    state.autoRunning = true;
-    updateAutoButtons();
-    const skipNote = skipped ? `，跳过 ${skipped} 位已联系` : '';
-    setStatus(`自动打招呼开始，${candidates.length} 人待处理${skipNote}`);
-
-    for (const item of candidates) {
-      if (!state.autoRunning) break;
-      if (state.greetingCount >= state.dailyCap) {
-        setStatus('已达每日上限，自动停止');
-        break;
-      }
-
-      // Safety check
-      const hazard = checkHazards();
-      if (hazard) {
-        setStatus(`检测到安全阻断: ${hazard}，自动停止`, true);
-        state.autoRunning = false;
-        updateAutoButtons();
-        break;
-      }
-
-      // Visibility check: tab must be in foreground
-      if (document.hidden) {
-        setStatus('标签页不在前台，暂停自动打招呼');
-        // Wait until visible again
-        await waitForVisible();
-        if (!state.autoRunning) break;
-      }
-
-      setStatus(`正在打招呼: ${item.name} (${item.score}分) #${state.greetingCount + 1}`);
-
-      // Personalized draft (国产 LLM, falls back to template) for the fill path.
-      const personalizedDraft = await fetchDraft(item);
-
-      // Click greet button on card
-      const clicked = clickGreetBtn(item.cardEl);
-      if (!clicked) {
-        // Fallback: open chat then fill + try to find send button
-        if (item.cardEl) openCardChat(item.cardEl);
-        await sleep(1500);
-        fillChatInput(personalizedDraft || `您好，我们有合适的岗位机会想和您聊聊`);
-        await sleep(500);
-        // Try to click send button
-        const sendBtn = document.querySelector('button[class*="send"], [class*="btn-send"]');
-        if (sendBtn) sendBtn.click();
-      }
-
-      incrCounter();
-      document.getElementById('bh-count').textContent = state.greetingCount;
-
-      // Log to backend
-      try {
-        await apiPost('/log-greeting', {
-          expectId: item.expectId,
-          name: item.name,
-          mode: 'auto',
-          job_id: state.jobId,
-        });
-      } catch { /* non-critical */ }
-
-      // Random delay
-      const delay = randDelay();
-      setStatus(`${item.name} 已打招呼，等待 ${Math.round(delay/1000)}秒...`);
-      await sleep(delay);
-    }
-
-    state.autoRunning = false;
-    updateAutoButtons();
-    if (state.greetingCount >= state.dailyCap) {
-      setStatus(`今日 ${state.greetingCount}/${state.dailyCap} 已完成`);
-    } else {
-      setStatus('自动打招呼结束');
-    }
-  }
-
-  function doAutoStop() {
-    state.autoRunning = false;
-    updateAutoButtons();
-    setStatus('已停止自动打招呼');
-  }
 
   function sleep(ms) {
     return new Promise(r => setTimeout(r, ms));
   }
 
-  function waitForVisible() {
-    return new Promise(resolve => {
-      const handler = () => {
-        if (!document.hidden) {
-          document.removeEventListener('visibilitychange', handler);
-          resolve();
-        }
-      };
-      document.addEventListener('visibilitychange', handler);
-      // Also timeout after 5 min
-      setTimeout(resolve, 300000);
-    });
-  }
 
   // ─── Load config from backend on start ────────────────────────────
   async function loadConfig() {
@@ -1684,17 +1442,14 @@
       if (cfg.automation) {
         state.threshold = cfg.automation.score_threshold || state.threshold;
         state.dailyCap = cfg.automation.daily_cap || state.dailyCap;
-        state.delayMin = cfg.automation.delay_min_s || state.delayMin;
-        state.delayMax = cfg.automation.delay_max_s || state.delayMax;
       }
       state.configLoaded = true;
       // Update panel controls
       const tEl = document.getElementById('bh-threshold');
       const tvEl = document.getElementById('bh-threshold-val');
-      const capEl = document.getElementById('bh-cap');
       if (tEl) { tEl.value = state.threshold; }
       if (tvEl) { tvEl.textContent = state.threshold; }
-      if (capEl) { capEl.textContent = state.dailyCap; }
+      updateDailyProgress();
     } catch {
       setStatus('后端未连接，使用默认配置', true);
     }
@@ -1859,10 +1614,12 @@
         <button class="bh-job-mode-btn ${isCreate ? 'active' : ''}" id="bh-job-mode-create">新增岗位</button>
       </div>
       <div class="bh-job-grid">
+        <div class="bh-job-subtitle">岗位信息</div>
         <div class="bh-job-field full">
           <label>岗位名称</label>
           <input id="bh-job-title" placeholder="例如：电商运营" value="${esc(job.title || '')}">
         </div>
+        <div class="bh-job-subtitle">基础门槛</div>
         <div class="bh-job-field">
           <label>年龄下限</label>
           <input id="bh-job-age-min" type="number" min="0" max="80" value="${jobNumber(job, 'age_min', 24)}">
@@ -1889,6 +1646,7 @@
             ${['any', 'today', '3d', 'week'].map(v => `<option value="${v}" ${active === v ? 'selected' : ''}>${activeRequirementLabel(v)}</option>`).join('')}
           </select>
         </div>
+        <div class="bh-job-subtitle">筛选与评分</div>
         <div class="bh-job-field full">
           <label>跳槽频率（BOSS 原生单选）</label>
           <select id="bh-job-turnover-frequency">
@@ -1905,10 +1663,11 @@
         </div>
       </div>
       <div class="bh-job-actions">
+        <button class="bh-btn bh-btn-secondary" id="bh-diag" title="复制当前页面结构，供故障排查">诊断</button>
         <button class="bh-btn bh-btn-secondary" id="bh-job-cancel">收起</button>
         <button class="bh-btn bh-btn-primary" id="bh-job-save">${isCreate ? '创建岗位' : '保存'}</button>
       </div>
-      <div class="bh-job-hint">${isCreate ? '创建后会自动选中新岗位。' : '保存后点击“扫描列表”重新评分；活跃要求会作为硬筛选。'}</div>
+      ${isCreate ? '<div class="bh-job-hint">创建后会自动选中新岗位。</div>' : ''}
     `;
     box.querySelector('#bh-job-mode-edit')?.addEventListener('click', () => {
       state.jobConfigMode = 'edit';
@@ -1920,6 +1679,7 @@
     });
     box.querySelector('#bh-job-cancel')?.addEventListener('click', () => box.classList.remove('open'));
     box.querySelector('#bh-job-save')?.addEventListener('click', saveJobConfig);
+    box.querySelector('#bh-diag')?.addEventListener('click', diagnose);
   }
 
   function intField(id, fallback) {
@@ -2093,9 +1853,7 @@
     const cardEl = badge.parentElement;
     const item = state.scanned.find(s => s.cardEl === cardEl);
     if (!item) return;
-    if (state.mode === 'semi') {
-      doSemiFill(item);
-    }
+    doSemiFill(item);
   }
 
   const _badgeBoundDocs = new WeakSet();
@@ -2108,21 +1866,25 @@
   }
 
   // ─── Queue panel (队列复盘悬浮层) ──────────────────────────────────
-  // Second floating panel: shows /api/queue/today rows, supports
-  // skip/restore, bulk-skip/restore, AI rerank, and click-to-locate on
-  // the current BOSS page. Coexists with the small scan panel — the scan
-  // panel keeps its scan/greet flow untouched. Uses BACKEND_ROOT (no /ext).
+  // Second floating panel: current pending snapshot + durable completed
+  // greeting history. Only a real card on the current page can be opened.
   state.queuePanel = {
     open: false,
-    tab: 'queue',            // 'queue' | 'skipped'
-    jobId: '',               // queue-only job filter; empty means all jobs
+    tab: 'pending',          // 'pending' | 'completed'
+    jobId: '',               // defaults to the assistant's selected job
     items: [],               // last-known list (kept in DOM order via diff)
     itemsById: new Map(),    // match_id → item (fast lookup for actions/optimistic revert)
     loading: false,
-    autoRefreshTimer: null,
+    requestSeq: 0,
     llmBusy: false,
-    bulkGreetRunning: false, // true while doBulkGreet loop is active
-    sendingId: null,         // match_id currently being sent (single-row or bulk)
+    counts: { pending: 0, completed: 0 },
+    activeItem: null,
+    activeOpen: false,
+    activeVerified: false,
+    activeAt: 0,
+    completionInFlight: new Set(),
+    undoTimer: null,
+    undoInterval: null,
   };
 
   function renderQueueJobFilter() {
@@ -2144,60 +1906,42 @@
     el = document.createElement('div');
     el.id = 'boss-helper-queue-panel';
     el.innerHTML = `
-      <div class="bhq-header">
-        <h3>队列复盘</h3>
+      <div class="bhq-nav">
         <div class="bhq-tabs">
-          <span class="bhq-tab active" data-tab="queue">队列</span>
-          <span class="bhq-tab" data-tab="skipped">已跳过</span>
+          <button class="bhq-tab active" data-tab="pending">待处理 <b class="bhq-tab-count" id="bhq-pending-count">0</b></button>
+          <button class="bhq-tab" data-tab="completed">已完成 <b class="bhq-tab-count" id="bhq-completed-count">0</b></button>
         </div>
-        <span class="bhq-header-spacer"></span>
-        <span class="bhq-header-btn" id="bhq-refresh" title="立即刷新">↻</span>
-        <span class="bhq-close" id="bhq-close">×</span>
+        <span class="bhq-nav-spacer"></span>
+        <button class="bhq-header-btn bhq-clear-pending" id="bhq-clear-pending" title="清空所有待处理" aria-label="清空所有待处理">⌫</button>
       </div>
       <div class="bhq-toolbar">
-        <label class="bhq-filter">岗位
+        <label class="bhq-filter"><span class="bhq-filter-label">筛选岗位</span>
           <select id="bhq-job-filter"><option value="">全部岗位</option></select>
         </label>
         <button class="bhq-act bhq-act-primary" id="bhq-rerank" style="display:none" title="只评分尚未有 AI 分数的候选人">AI评分</button>
-        <button class="bhq-act bhq-act-danger" id="bhq-bulk-skip" style="display:none">一键跳过</button>
-        <button class="bhq-act bhq-act-success" id="bhq-bulk-restore" style="display:none">一键恢复</button>
         <span class="bhq-toolbar-status" id="bhq-toolbar-status">就绪</span>
       </div>
       <div class="bhq-progress-wrap" id="bhq-progress-wrap" style="display:none">
         <div class="bhq-progress-bar"><div class="bhq-progress-fill" id="bhq-progress-fill"></div></div>
         <span class="bhq-progress-text" id="bhq-progress-text"></span>
       </div>
+      <div class="bhq-undo-bar" id="bhq-undo-bar">
+        <span class="bhq-undo-message" id="bhq-undo-message"></span>
+        <span class="bhq-undo-count" id="bhq-undo-count"></span>
+        <button class="bhq-undo-btn" id="bhq-undo-btn" type="button">撤销</button>
+      </div>
       <div class="bhq-list" id="bhq-list"><div class="bhq-empty">加载中…</div></div>
     `;
-    document.body.appendChild(el);
+    document.getElementById('boss-helper-panel')?.appendChild(el);
     renderQueueJobFilter();
-
-    // Drag by header
-    const header = el.querySelector('.bhq-header');
-    let dragging = false, dx = 0, dy = 0;
-    header.addEventListener('mousedown', (e) => {
-      // Don't start drag when clicking interactive header controls
-      if (e.target.closest('.bhq-tab, .bhq-header-btn, .bhq-close')) return;
-      dragging = true;
-      const rect = el.getBoundingClientRect();
-      dx = e.clientX - rect.left;
-      dy = e.clientY - rect.top;
-    });
-    document.addEventListener('mousemove', (e) => {
-      if (!dragging) return;
-      el.style.left = (e.clientX - dx) + 'px';
-      el.style.top = (e.clientY - dy) + 'px';
-      el.style.right = 'auto';
-    });
-    document.addEventListener('mouseup', () => { dragging = false; });
 
     // Tab switch
     el.querySelectorAll('.bhq-tab').forEach(t => {
       t.addEventListener('click', () => {
         const tab = t.getAttribute('data-tab');
         if (tab === state.queuePanel.tab) return;
-        if (state.queuePanel.bulkGreetRunning || state.queuePanel.llmBusy) {
-          showToast('批量打招呼进行中，请先停止', true);
+        if (state.queuePanel.llmBusy) {
+          showToast('当前任务进行中，请稍后切换', true);
           return;
         }
         state.queuePanel.tab = tab;
@@ -2205,32 +1949,25 @@
           x.classList.toggle('active', x.getAttribute('data-tab') === tab);
         });
         applyToolbarVisibility();
-        fetchQueue(true);  // full refresh on tab switch
+        fetchQueue(true, true);
       });
     });
 
-    // Header buttons
-    el.querySelector('#bhq-close').addEventListener('click', closeQueuePanel);
-    el.querySelector('#bhq-refresh').addEventListener('click', () => {
-      if (state.queuePanel.bulkGreetRunning || state.queuePanel.llmBusy) { showToast('当前任务进行中，请稍后刷新', true); return; }
-      fetchQueue(true);
-    });
+    el.querySelector('#bhq-clear-pending').addEventListener('click', clearAllPendingCandidates);
     el.querySelector('#bhq-rerank').addEventListener('click', doTrackedLlmRerank);
-    el.querySelector('#bhq-bulk-skip').addEventListener('click', () => doBulkStatus('skipped'));
-    el.querySelector('#bhq-bulk-restore').addEventListener('click', () => doBulkStatus('new'));
     el.querySelector('#bhq-job-filter').addEventListener('change', (e) => {
-      if (state.queuePanel.bulkGreetRunning || state.queuePanel.llmBusy) {
+      if (state.queuePanel.llmBusy) {
         e.target.value = state.queuePanel.jobId;
-        showToast('批量打招呼进行中，请先停止', true);
+        showToast('当前任务进行中，请稍后切换岗位', true);
         return;
       }
       state.queuePanel.jobId = e.target.value;
       applyToolbarVisibility();
-      fetchQueue(true);
+      fetchQueue(true, true);
     });
 
-    // Row click delegation (locate + action buttons)
     el.querySelector('#bhq-list').addEventListener('click', onListClick);
+    el.querySelector('#bhq-list').addEventListener('keydown', onListKeydown);
 
     applyToolbarVisibility();
     return el;
@@ -2244,59 +1981,42 @@
 
   function applyToolbarVisibility() {
     const rerank = document.getElementById('bhq-rerank');
-    const bulkSkip = document.getElementById('bhq-bulk-skip');
-    const bulkRestore = document.getElementById('bhq-bulk-restore');
     if (!rerank) return;
-    const isQueue = state.queuePanel.tab === 'queue';
+    const isQueue = state.queuePanel.tab === 'pending';
     const rerankJobId = getRerankJobId();
     rerank.style.display = isQueue ? 'inline-block' : 'none';
     rerank.disabled = !isQueue || !rerankJobId || state.queuePanel.llmBusy;
     rerank.title = rerankJobId ? '只评分尚未有 AI 分数的候选人' : '当前列表包含多个岗位，请先选择一个岗位';
-    bulkSkip.style.display = isQueue ? 'inline-block' : 'none';
-    bulkRestore.style.display = isQueue ? 'none' : 'inline-block';
-    bulkSkip.disabled = state.queuePanel.llmBusy;
-    bulkRestore.disabled = state.queuePanel.llmBusy;
-    rerank.title = rerankJobId ? '只评分尚未有 AI 分数的候选人' : '当前列表包含多个岗位，请先选择一个岗位';
   }
 
   function openQueuePanel() {
-    const el = ensureQueuePanel();
-    // The queue starts broad so recruiters can review every role first.
-    // AI评分 remains available after selecting one concrete job.
-    state.queuePanel.jobId = '';
+    ensureQueuePanel();
+    const panel = document.getElementById('boss-helper-panel');
+    if (!panel) return;
+    state.queuePanel.jobId = state.jobId || state.queuePanel.jobId || '';
     renderQueueJobFilter();
     applyToolbarVisibility();
-    // Layout: wide screen → side-by-side left of small panel; narrow → stacked
-    // below. Judged once on open (not on resize) — cheap & good enough.
-    const stacked = window.innerWidth < 1280;
-    el.classList.toggle('bhq-stacked', stacked);
-    if (stacked) {
-      const smallPanel = document.getElementById('boss-helper-panel');
-      const smallRect = smallPanel ? smallPanel.getBoundingClientRect() : { bottom: 80 };
-      el.style.top = (smallRect.bottom + 12) + 'px';
-      el.style.right = '20px';
-      el.style.left = 'auto';
-    } else {
-      el.style.top = '200px';
-      el.style.right = '372px';
-      el.style.left = 'auto';
+    panel.classList.remove('bh-collapsed');
+    panel.classList.add('bh-queue-mode');
+    const collapse = document.getElementById('bh-collapse');
+    if (collapse) {
+      collapse.innerHTML = headerIcon('collapse');
+      collapse.title = '收起';
+      collapse.setAttribute('aria-label', '收起招聘助手');
+      collapse.setAttribute('aria-expanded', 'true');
     }
-    el.style.display = 'flex';
+    const title = document.getElementById('bh-header-title');
+    if (title) title.textContent = '候选人队列';
     state.queuePanel.open = true;
-    fetchQueue(true);
-    if (state.queuePanel.autoRefreshTimer) clearInterval(state.queuePanel.autoRefreshTimer);
-    state.queuePanel.autoRefreshTimer = setInterval(() => fetchQueue(false), 10000);
+    fetchQueue(true, true);
   }
 
   function closeQueuePanel() {
-    const el = document.getElementById('boss-helper-queue-panel');
-    if (el) el.style.display = 'none';
-    closeCandidateArchive();
+    const panel = document.getElementById('boss-helper-panel');
+    panel?.classList.remove('bh-queue-mode');
+    const title = document.getElementById('bh-header-title');
+    if (title) title.textContent = '招聘助手';
     state.queuePanel.open = false;
-    if (state.queuePanel.autoRefreshTimer) {
-      clearInterval(state.queuePanel.autoRefreshTimer);
-      state.queuePanel.autoRefreshTimer = null;
-    }
   }
 
   function setQueueStatus(msg, err = false) {
@@ -2320,25 +2040,80 @@
     t._hideTimer = setTimeout(() => { t.className = 'bhq-toast'; }, 2200);
   }
 
-  async function fetchQueue(showLoading) {
-    if (state.queuePanel.loading) return;
+  function updateTabCounts() {
+    const pending = document.getElementById('bhq-pending-count');
+    const completed = document.getElementById('bhq-completed-count');
+    if (pending) pending.textContent = state.queuePanel.counts.pending >= 100 ? '100+' : String(state.queuePanel.counts.pending);
+    if (completed) completed.textContent = state.queuePanel.counts.completed >= 100 ? '100+' : String(state.queuePanel.counts.completed);
+  }
+
+  function filterQueueItems(items, view) {
+    const statuses = view === 'completed' ? COMPLETED_QUEUE_STATUSES : PENDING_QUEUE_STATUSES;
+    return (Array.isArray(items) ? items : []).filter(item => statuses.has(item?.status));
+  }
+
+  async function clearAllPendingCandidates() {
+    if (state.queuePanel.llmBusy || state.queuePanel.completionInFlight.size) {
+      showToast('当前有任务进行中，请稍后清空', true);
+      return;
+    }
+    const confirmed = window.confirm('将清空所有岗位的待处理候选人及未发送草稿。\n\n已完成候选人不会被删除。');
+    if (!confirmed) return;
+
+    const button = document.getElementById('bhq-clear-pending');
+    if (button) { button.disabled = true; button.textContent = '…'; }
+    try {
+      const result = await apiPost('/clear-pending', {});
+      state.scanned = [];
+      clearActiveCandidate();
+      hideCompletionUndo();
+      const count = Number(result?.deleted_matches || 0);
+      showToast(count ? `已清空 ${count} 位待处理候选人` : '没有可清空的待处理候选人');
+      await fetchQueue(true, true);
+    } catch (err) {
+      showToast(`清空待处理失败：${err.message}`, true);
+    } finally {
+      if (button) { button.disabled = false; button.textContent = '⌫'; }
+    }
+  }
+
+  async function fetchQueue(showLoading, includeCounts = false) {
+    const requestSeq = ++state.queuePanel.requestSeq;
+    const requestedTab = state.queuePanel.tab;
+    const requestedJobId = state.queuePanel.jobId;
     state.queuePanel.loading = true;
     if (showLoading) setQueueStatus('加载中…');
     const params = new URLSearchParams();
-    if (state.queuePanel.jobId) params.append('job_id', state.queuePanel.jobId);
-    if (state.queuePanel.tab === 'skipped') params.append('status_filter', 'skipped');
+    if (requestedJobId) params.append('job_id', requestedJobId);
+    params.append('view', requestedTab);
     params.append('limit', '100');
     try {
-      const items = await apiGetRoot('/queue/today?' + params.toString());
-      state.queuePanel.items = Array.isArray(items) ? items : [];
+      const responseItems = await apiGetRoot('/queue/today?' + params.toString());
+      if (requestSeq !== state.queuePanel.requestSeq || requestedTab !== state.queuePanel.tab || requestedJobId !== state.queuePanel.jobId) return;
+      state.queuePanel.items = filterQueueItems(responseItems, requestedTab);
       state.queuePanel.itemsById = new Map(state.queuePanel.items.map(x => [x.match_id, x]));
+      state.queuePanel.counts[requestedTab] = state.queuePanel.items.length;
       diffRenderQueueList(state.queuePanel.items);
       applyToolbarVisibility();
+      updateTabCounts();
       setQueueStatus('就绪');
+      if (includeCounts) {
+        const otherTab = requestedTab === 'pending' ? 'completed' : 'pending';
+        const otherParams = new URLSearchParams();
+        if (requestedJobId) otherParams.append('job_id', requestedJobId);
+        otherParams.append('view', otherTab);
+        otherParams.append('limit', '100');
+        try {
+          const otherItems = await apiGetRoot('/queue/today?' + otherParams.toString());
+          if (requestSeq !== state.queuePanel.requestSeq || requestedJobId !== state.queuePanel.jobId) return;
+          state.queuePanel.counts[otherTab] = filterQueueItems(otherItems, otherTab).length;
+          updateTabCounts();
+        } catch { /* keep the last count; the visible list already loaded */ }
+      }
     } catch (err) {
       setQueueStatus('加载失败: ' + err.message, true);
     } finally {
-      state.queuePanel.loading = false;
+      if (requestSeq === state.queuePanel.requestSeq) state.queuePanel.loading = false;
     }
   }
 
@@ -2356,17 +2131,6 @@
     return String(s == null ? '' : s)
       .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
       .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
-  }
-
-  function statusTitle(status) {
-    return ({
-      new: '新',
-      queued: '已入队',
-      drafted: '已生成话术',
-      filled: '已填入输入框',
-      sent_manual: '已发送',
-      skipped: '已跳过',
-    })[status] || status || '';
   }
 
   // Build the inline info line: age岁 · work_years · education · salary · city
@@ -2393,50 +2157,44 @@
 
   // Row template — minimal fields per v1 spec (no CheckBadges/skill tags/preview).
   function buildRowHTML(item, isLive) {
-    const isSkipped = state.queuePanel.tab === 'skipped';
+    const isCompleted = state.queuePanel.tab === 'completed';
+    const isActive = state.queuePanel.activeItem?.match_id === item.match_id;
     const missingHtml = item.missing_info
       ? `<div class="bhq-missing" title="${esc(item.missing_info)}">⚠ 缺：${esc(item.missing_info)}</div>` : '';
     const llmBadge = (item.llm_score != null)
       ? `<span class="bhq-badge ${llmBadgeClass(item.llm_score)}" title="AI 精评分">AI ${Math.round(item.llm_score)}</span>` : '';
-    const candidateAction = isLive
-      ? `<button class="bhq-act bhq-act-primary" data-act="locate" data-mid="${item.match_id}">打开</button>`
-      : `<button class="bhq-act bhq-act-secondary" data-act="archive" data-mid="${item.match_id}">档案</button>`;
-    const statusAction = isSkipped
-      ? `<button class="bhq-act bhq-act-success" data-act="restore" data-mid="${item.match_id}">恢复</button>`
-      : `<button class="bhq-act bhq-act-secondary" data-act="skip" data-mid="${item.match_id}">跳过</button>`;
-    const actionBtns = candidateAction + statusAction;
+    const actionBtns = !isCompleted && isLive && isActive && state.queuePanel.activeOpen
+      ? `<button class="bhq-act bhq-act-success" data-act="complete" data-mid="${item.match_id}">标记完成</button>`
+      : '';
+    const completedAt = isCompleted && item.completed_at
+      ? `<div class="bhq-info">完成于 ${esc(formatQueueTime(item.completed_at))}</div>` : '';
     return `
       <div class="bhq-row-main">
         <div class="bhq-name-line">
-          <span class="bhq-status-dot ${item.status || 'new'}" title="${esc(statusTitle(item.status))}"></span>
           <span class="bhq-name">${esc(item.name || '未知')}</span>
-          <span class="bhq-presence ${isLive ? 'live' : 'history'}">${isLive ? '当前页' : '历史'}</span>
-          <span class="bhq-job" title="岗位：${esc(item.job_title || '未指定岗位')}">${esc(item.job_title || '未指定岗位')}</span>
+          ${isLive ? '<span class="bhq-presence live">当前页</span>' : ''}
+          ${state.queuePanel.jobId ? '' : `<span class="bhq-job" title="岗位：${esc(item.job_title || '未指定岗位')}">${esc(item.job_title || '未指定岗位')}</span>`}
           <span class="bhq-badge ${scoreBadgeClass(item.score)}" title="规则分">${Math.round(item.score)}</span>
           ${llmBadge}
         </div>
         <div class="bhq-info">${esc(buildInfoLine(item))}</div>
+        ${completedAt}
         ${missingHtml}
       </div>
-      <div class="bhq-row-actions">${actionBtns}</div>
+      ${actionBtns ? `<div class="bhq-row-actions">${actionBtns}</div>` : ''}
     `;
   }
 
-  function archiveTime(value) {
+  function formatQueueTime(value) {
     if (!value) return '';
-    const date = new Date(value);
+    // SQLite drops timezone offsets. Backend timestamps are stored in UTC, so
+    // an offset-less value (e.g. 2026-07-16T14:32:43) must be parsed as UTC
+    // instead of being mistaken for the browser's local China time.
+    const raw = String(value);
+    const hasTimezone = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(raw);
+    const date = new Date(hasTimezone ? raw : `${raw}Z`);
     if (Number.isNaN(date.getTime())) return '';
-    return date.toLocaleString('zh-CN', { hour12: false });
-  }
-
-  function archiveField(label, value) {
-    if (!value) return '';
-    return `<div class="bh-archive-field"><span class="bh-archive-label">${esc(label)}</span><div class="bh-archive-value">${esc(value)}</div></div>`;
-  }
-
-  function archiveSection(title, content, rawHtml = false) {
-    if (!content) return '';
-    return `<section class="bh-archive-card"><h4 class="bh-archive-title">${esc(title)}</h4><div class="${rawHtml ? '' : 'bh-archive-text'}">${rawHtml ? content : esc(content)}</div></section>`;
+    return date.toLocaleString('zh-CN', { hour12: false, timeZone: SERVER_TIME_ZONE });
   }
 
   function safeBossUrl(value) {
@@ -2450,139 +2208,19 @@
     }
   }
 
-  let candidateArchiveKeyHandler = null;
-
-  function closeCandidateArchive() {
-    document.getElementById('boss-helper-candidate-archive')?.remove();
-    document.getElementById('boss-helper-candidate-archive-backdrop')?.remove();
-    if (candidateArchiveKeyHandler) {
-      document.removeEventListener('keydown', candidateArchiveKeyHandler);
-      candidateArchiveKeyHandler = null;
-    }
-  }
-
-  function openCandidateArchive(item, options = {}) {
-    if (!item) return;
-    closeCandidateArchive();
-
-    const hasLiveCard = !!(item.boss_id && findCardByBossId(item.boss_id));
-    const basics = buildInfoLine(item);
-    const work = [item.company, item.title].filter(Boolean).join(' · ');
-    const education = [item.school, item.major].filter(Boolean).join(' · ');
-    const savedAt = archiveTime(item.updated_at || item.created_at);
-    const snapshot = item.experience_summary || item.raw_snapshot || '';
-    const shareUrl = safeBossUrl(item.share_url);
-    const tags = String(item.skills || '').split(/[,，、]/).map(x => x.trim()).filter(Boolean);
-    const tagsHtml = tags.length
-      ? `<div class="bh-archive-tags">${tags.map(x => `<span class="bh-archive-tag">${esc(x)}</span>`).join('')}</div>`
-      : '';
-    const notice = hasLiveCard
-      ? '当前页面仍有该候选人的真实卡片，可以继续打开 BOSS 原生卡片并打招呼。'
-      : (options.reason || '当前页面没有该候选人的真实卡片。这里展示的是最近一次保存的档案，档案本身不能直接打招呼。');
-
-    const backdrop = document.createElement('div');
-    backdrop.id = 'boss-helper-candidate-archive-backdrop';
-    backdrop.className = 'bh-archive-backdrop';
-    const drawer = document.createElement('aside');
-    drawer.id = 'boss-helper-candidate-archive';
-    drawer.setAttribute('role', 'dialog');
-    drawer.setAttribute('aria-modal', 'true');
-    drawer.setAttribute('aria-label', `${item.name || '候选人'}档案`);
-    drawer.innerHTML = `
-      <header class="bh-archive-header">
-        <div class="bh-archive-header-main">
-          <div class="bh-archive-eyebrow">候选人档案 · 只读快照</div>
-          <h3>${esc(item.name || '未知候选人')}</h3>
-        </div>
-        <button class="bh-archive-close" data-archive-act="close" aria-label="关闭">×</button>
-      </header>
-      <div class="bh-archive-notice ${hasLiveCard ? 'live' : 'history'}">${esc(notice)}</div>
-      <div class="bh-archive-body">
-        <section class="bh-archive-card">
-          <h4 class="bh-archive-title">基本资料</h4>
-          <div class="bh-archive-grid">
-            ${archiveField('匹配岗位', item.job_title || '未指定岗位')}
-            ${archiveField('基础信息', basics || '暂无')}
-            ${archiveField('当前经历', work)}
-            ${archiveField('院校专业', education)}
-            ${archiveField('求职状态', item.job_status)}
-            ${archiveField('活跃状态', item.active_status)}
-            ${archiveField('来源关键词', item.source_keyword)}
-            ${archiveField('最近保存', savedAt)}
-          </div>
-        </section>
-        <section class="bh-archive-card">
-          <h4 class="bh-archive-title">匹配评分</h4>
-          <div class="bh-archive-scores">
-            <div class="bh-archive-score"><span class="bh-archive-label">规则评分</span><b>${Math.round(Number(item.score) || 0)}</b></div>
-            <div class="bh-archive-score"><span class="bh-archive-label">AI 精评分</span><b>${item.llm_score == null ? '—' : Math.round(Number(item.llm_score) || 0)}</b></div>
-          </div>
-        </section>
-        ${archiveSection('技能标签', tagsHtml, true)}
-        ${archiveSection('匹配理由', item.match_reason)}
-        ${archiveSection('AI 精评理由', item.llm_reason)}
-        ${archiveSection('资料缺失提醒', item.missing_info)}
-        ${archiveSection('候选人经历快照', snapshot)}
-      </div>
-      <footer class="bh-archive-footer">
-        <button class="bh-archive-btn secondary" data-archive-act="close">关闭</button>
-        ${shareUrl ? '<button class="bh-archive-btn link" data-archive-act="link">打开保存链接</button>' : ''}
-        <button class="bh-archive-btn primary" data-archive-act="${hasLiveCard ? 'locate' : 'retry'}" ${item.boss_id ? '' : 'disabled'}>${hasLiveCard ? '打开 BOSS 原生卡片' : (item.boss_id ? '重新检查当前页' : '缺少定位 ID')}</button>
-      </footer>
-    `;
-
-    backdrop.addEventListener('click', closeCandidateArchive);
-    drawer.addEventListener('click', (e) => {
-      const btn = e.target.closest('[data-archive-act]');
-      if (!btn) return;
-      const act = btn.getAttribute('data-archive-act');
-      if (act === 'close') return closeCandidateArchive();
-      if (act === 'link' && shareUrl) {
-        window.open(shareUrl, '_blank', 'noopener,noreferrer');
-        return;
-      }
-      if (act === 'locate' && hasLiveCard) {
-        closeCandidateArchive();
-        locateCardOnPage(item, { fallbackToArchive: true });
-        return;
-      }
-      if (act === 'retry' && item.boss_id) retryLocateCandidate(item);
-    });
-    candidateArchiveKeyHandler = (e) => {
-      if (e.key === 'Escape') closeCandidateArchive();
-    };
-    document.addEventListener('keydown', candidateArchiveKeyHandler);
-    document.body.appendChild(backdrop);
-    document.body.appendChild(drawer);
-    drawer.querySelector('.bh-archive-close')?.focus();
-  }
-
-  function retryLocateCandidate(item) {
-    closeCandidateArchive();
-    if (findCardByBossId(item.boss_id)) {
-      diffRenderQueueList(state.queuePanel.items);
-      return locateCardOnPage(item, { fallbackToArchive: true });
-    }
-    openCandidateArchive(item, {
-      reason: '已检查当前页面已经渲染的候选人卡片，仍未找到该候选人。为降低风控风险，脚本不会自动滚动、翻页或持续查找。',
-    });
-    showToast('当前页仍未找到该候选人');
-  }
-
-  // Cheap change-detection signature for a row (score+status+llm_score+reason+sending).
+  // Cheap change-detection signature for a row.
   function rowSig(item, isLive) {
-    const sending = state.queuePanel.sendingId === item.match_id ? 1 : 0;
-    return `${item.status}|${item.job_id ?? ''}|${item.job_title ?? ''}|${item.score}|${item.llm_score ?? ''}|${item.missing_info ?? ''}|${isLive ? 1 : 0}|${sending}`;
+    const active = state.queuePanel.activeItem?.match_id === item.match_id ? 1 : 0;
+    return `${item.status}|${item.job_id ?? ''}|${item.job_title ?? ''}|${item.score}|${item.llm_score ?? ''}|${item.missing_info ?? ''}|${item.completed_at ?? ''}|${isLive ? 1 : 0}|${active}|${state.queuePanel.activeOpen ? 1 : 0}|${state.queuePanel.jobId}`;
   }
 
-  // Incremental diff render: upsert / remove / move rows by match_id so scroll
-  // position and hover state survive the 10s auto-refresh.
+  // Incremental diff render: preserve scroll and focus across event-driven refreshes.
   function diffRenderQueueList(items) {
     const listEl = document.getElementById('bhq-list');
     if (!listEl) return;
 
     if (!items.length) {
-      listEl.innerHTML = `<div class="bhq-empty">${state.queuePanel.tab === 'skipped' ? '暂无已跳过记录' : '队列为空（先在页面里扫描）'}</div>`;
+      listEl.innerHTML = `<div class="bhq-empty">${state.queuePanel.tab === 'completed' ? '暂无已完成记录' : '待处理为空（先扫描当前列表）'}</div>`;
       return;
     }
 
@@ -2606,6 +2244,8 @@
     let prev = null;
     for (const item of items) {
       const isLive = !!item.boss_id && liveBossIds.has(String(item.boss_id));
+      const actionable = state.queuePanel.tab === 'pending' && isLive;
+      const active = state.queuePanel.activeItem?.match_id === item.match_id;
       let node = existing.get(item.match_id);
       if (!node) {
         node = document.createElement('div');
@@ -2623,6 +2263,17 @@
         }
         node._sig = sig;
       }
+      node.classList.toggle('is-actionable', actionable);
+      node.classList.toggle('is-active', active);
+      if (actionable) {
+        node.setAttribute('role', 'button');
+        node.setAttribute('tabindex', '0');
+        node.setAttribute('aria-label', `打开候选人简历：${item.name || '未知'}`);
+      } else {
+        node.removeAttribute('role');
+        node.removeAttribute('tabindex');
+        node.removeAttribute('aria-label');
+      }
       // Ensure DOM order matches items[]
       const nextSibling = prev ? prev.nextSibling : listEl.firstChild;
       if (nextSibling !== node) listEl.insertBefore(node, nextSibling);
@@ -2630,234 +2281,251 @@
     }
   }
 
-  // Click dispatcher: action buttons intercepted first; otherwise treat the
-  // row click as "locate this candidate's card on the current BOSS page".
   function onListClick(e) {
     const actBtn = e.target.closest('button[data-act]');
-    if (actBtn) {
-      e.stopPropagation();
-      const mid = Number(actBtn.getAttribute('data-mid'));
-      const act = actBtn.getAttribute('data-act');
-      const item = state.queuePanel.itemsById.get(mid);
-      if (!item) return;
-      if (state.queuePanel.bulkGreetRunning && !['restore', 'archive'].includes(act)) {
-        showToast('批量打招呼进行中，请稍候', true);
-        return;
-      }
-      if (act === 'archive') return openCandidateArchive(item);
-      if (act === 'locate') return locateCardOnPage(item, { fallbackToArchive: true });
-      if (act === 'skip') return handleStatusChange(item, 'skipped');
-      if (act === 'restore') return handleStatusChange(item, 'new');
-      return;
-    }
     const row = e.target.closest('.bhq-row');
     if (!row) return;
-    const mid = Number(row.getAttribute('data-mid'));
+    const mid = Number((actBtn || row).getAttribute('data-mid'));
     const item = state.queuePanel.itemsById.get(mid);
     if (!item) return;
-    if (!item.boss_id) {
-      openCandidateArchive(item, { reason: '该历史记录没有可用于定位 BOSS 卡片的候选人 ID，已为你打开保存的档案。' });
+    if (actBtn?.getAttribute('data-act') === 'complete') {
+      e.stopPropagation();
+      markCandidateCompleted(item, 'manual');
       return;
     }
-    locateCardOnPage(item, { fallbackToArchive: true });
+    if (!row.classList.contains('is-actionable')) return;
+    locateCardOnPage(item);
   }
 
-  // Single place that performs a real send for a queue item — used by both
-  // handleGreet (mode: 'manual') and doBulkGreet (mode: 'auto').
-  //
-  // Probe flow (BOSS 推荐页限制：点"打招呼"要么弹出可编辑招呼框、要么直接发
-  // 送后台配置的招呼语，无法在发送前插入自定义文本):
-  //   1. Trigger BOSS's greet UI (native 打招呼 button, or resume-panel button).
-  //   2. Poll up to 5s for an editable chat/greet input to appear.
-  //      - Appears  → this account supports custom greetings: fill our
-  //        template + click send.  reason: ok.
-  //      - Never appears → the account sent its default 招呼语 immediately;
-  //        we CANNOT inject the template.  reason: 'no_editable' (do NOT mark
-  //        as sent — BOSS blocks re-greeting anyway, so no dup risk).
-  async function sendGreetingToItem(item, opts) {
-    const mode = (opts && opts.mode) || 'manual';
+  function onListKeydown(e) {
+    if (e.key !== 'Enter' && e.key !== ' ') return;
+    const row = e.target.closest('.bhq-row.is-actionable');
+    if (!row) return;
+    e.preventDefault();
+    const item = state.queuePanel.itemsById.get(Number(row.getAttribute('data-mid')));
+    if (item) locateCardOnPage(item);
+  }
 
-    if (state.greetingCount >= state.dailyCap) {
-      return { ok: false, reason: 'cap' };
-    }
+  function candidateKey(item) {
+    const bossId = item?.boss_id || item?.expectId || '';
+    const jobId = item?.job_id || state.jobId || '';
+    return bossId && jobId ? `${jobId}:${bossId}` : '';
+  }
 
-    const hazard = checkHazards();
-    if (hazard) {
-      return { ok: false, reason: 'hazard', detail: hazard };
-    }
+  function setActiveCandidate(item, opened = false, verified = false) {
+    if (!item) return;
+    state.queuePanel.activeItem = {
+      ...item,
+      boss_id: item.boss_id || item.expectId || '',
+      job_id: item.job_id || state.jobId || '',
+    };
+    state.queuePanel.activeOpen = opened;
+    state.queuePanel.activeVerified = verified;
+    state.queuePanel.activeAt = Date.now();
+    if (state.queuePanel.open) diffRenderQueueList(state.queuePanel.items);
+  }
 
-    const target = findCardByBossId(item.boss_id);
-    if (!target) {
-      return { ok: false, reason: 'not_found' };
-    }
+  function clearActiveCandidate() {
+    state.queuePanel.activeItem = null;
+    state.queuePanel.activeOpen = false;
+    state.queuePanel.activeVerified = false;
+    state.queuePanel.activeAt = 0;
+    if (state.queuePanel.open) diffRenderQueueList(state.queuePanel.items);
+  }
 
-    let draftText = '';
+  async function markCandidateCompleted(item, mode = 'manual') {
+    const bossId = item?.boss_id || item?.expectId || '';
+    const jobId = item?.job_id || state.jobId || '';
+    const key = candidateKey({ ...item, boss_id: bossId, job_id: jobId });
+    if (!key || state.queuePanel.completionInFlight.has(key)) return;
+
+    state.queuePanel.completionInFlight.add(key);
+    setQueueStatus(`正在记录完成：${item.name || '候选人'}…`);
     try {
-      const res = await apiPostRoot(`/outreach/${item.match_id}/draft`, {});
-      draftText = (res && res.draft_text) || '';
-    } catch (err) {
-      return { ok: false, reason: 'error', detail: err.message };
-    }
-    if (!draftText) {
-      return { ok: false, reason: 'error', detail: '话术为空' };
-    }
-
-    // 1) Trigger BOSS's greet flow.
-    const triggered = await triggerGreetUI(target);
-    if (!triggered) {
-      dumpChatInputDiag();
-      return { ok: false, reason: 'no_greet_btn', detail: '未找到打招呼按钮，诊断已复制' };
-    }
-
-    if (document.hidden) await waitForVisible();
-
-    // 2) Wait for an editable greet/chat input to appear.
-    const input = await waitForChatInput(5000);
-    if (!input) {
-      dumpChatInputDiag();
-      // No editable box → account sends its default 招呼语 on click. Nothing
-      // we can inject; leave status untouched so it's not falsely "sent".
-      return { ok: false, reason: 'no_editable', detail: '账号点打招呼直接发默认招呼语，无法插入模板' };
-    }
-
-    // 3) Editable box present → fill our template and send.
-    fillInputEl(input, draftText);
-    await sleep(500);
-
-    const sendBtn = findSendButton();
-    if (!sendBtn) {
-      dumpChatInputDiag();
-      return { ok: false, reason: 'no_input', detail: '找到招呼框但没有发送按钮，诊断已复制' };
-    }
-    sendBtn.click();
-
-    incrCounter();
-    const countEl = document.getElementById('bh-count');
-    if (countEl) countEl.textContent = state.greetingCount;
-
-    try {
-      await apiPost('/log-greeting', {
-        expectId: item.boss_id,
-        name: item.name,
+      const result = await apiPost('/log-greeting', {
+        expectId: bossId,
+        name: item.name || '候选人',
         mode,
-        job_id: item.job_id,
+        job_id: jobId,
       });
-    } catch { /* non-critical, mirrors doAutoStart's existing tolerance */ }
-
-    item.status = mode === 'auto' ? 'sent_auto' : 'sent_manual';
-    return { ok: true };
-  }
-
-  // Human-readable failure text for sendGreetingToItem's structured result.
-  function greetFailMessage(res, item) {
-    if (res.reason === 'not_found') return `未找到卡片，可能已翻页：${item.name}`;
-    if (res.reason === 'hazard') return `检测到风控阻断(${res.detail})，已停止`;
-    if (res.reason === 'cap') return '已达每日上限';
-    if (res.reason === 'no_greet_btn') return `未找到打招呼按钮：${item.name}（诊断已复制）`;
-    if (res.reason === 'no_editable') return `你的账号点"打招呼"是直接发送默认招呼语，无法插入自定义模板`;
-    if (res.reason === 'no_input') return `找到招呼框但没有发送按钮：${item.name}`;
-    return `打招呼失败：${item.name}` + (res.detail ? `（${res.detail}）` : '');
-  }
-
-  async function handleGreet(item) {
-    if (state.autoRunning || state.queuePanel.bulkGreetRunning || state.queuePanel.sendingId) {
-      showToast('自动/批量打招呼进行中，请稍后再试', true);
-      return;
-    }
-    if (state.greetingCount >= state.dailyCap) {
-      showToast('已达每日上限', true);
-      return;
-    }
-    // sendingId flows into rowSig (see buildRowHTML/rowSig), so the row's
-    // disabled/"发送中…" state survives even if a concurrent 10s poll
-    // rebuilds this row's DOM node mid-send.
-    state.queuePanel.sendingId = item.match_id;
-    diffRenderQueueList(state.queuePanel.items);
-    setQueueStatus(`正在打招呼: ${item.name}…`);
-    try {
-      const res = await sendGreetingToItem(item, { mode: 'manual' });
-      if (res.ok) {
-        showToast(`已打招呼：${item.name}`);
-        setQueueStatus(`已打招呼：${item.name}`);
-        // Optimistic removal — mirrors handleStatusChange: a sent item no
-        // longer belongs in the 队列 tab (server-side filtering would drop
-        // it on the next fetch anyway; do it now so the row disappears
-        // immediately instead of staying visible-but-stale).
+      // Older production backends do not return `newly_completed`. A row that
+      // came from the pending view is still a reliable first-completion signal.
+      const incremented = typeof result?.newly_completed === 'boolean'
+        ? result.newly_completed
+        : !item.already_contacted && PENDING_QUEUE_STATUSES.has(item.status || 'new');
+      if (incremented) {
+        incrCounter();
+        state.queuePanel.counts.pending = Math.max(0, state.queuePanel.counts.pending - 1);
+        state.queuePanel.counts.completed += 1;
+        updateTabCounts();
+      }
+      if (state.queuePanel.tab === 'pending') {
         state.queuePanel.items = state.queuePanel.items.filter(x => x.match_id !== item.match_id);
         state.queuePanel.itemsById.delete(item.match_id);
-      } else {
-        const msg = greetFailMessage(res, item);
-        setQueueStatus(msg, true);
-        showToast(msg, true);
+        diffRenderQueueList(state.queuePanel.items);
       }
+      clearActiveCandidate();
+      setQueueStatus(`已完成：${item.name || '候选人'}`);
+      if (incremented && result?.match_id) {
+        showCompletionUndo({ ...item, match_id: result.match_id }, incremented);
+      } else {
+        showToast(`${item.name || '候选人'} 已在完成列表中`);
+      }
+      if (state.queuePanel.open) await fetchQueue(false, true);
     } catch (err) {
-      setQueueStatus('打招呼失败: ' + err.message, true);
-      showToast('打招呼失败: ' + err.message, true);
+      const message = `完成标记失败：${err.message}`;
+      setQueueStatus(message, true);
+      showToast(message, true);
     } finally {
-      state.queuePanel.sendingId = null;
-      diffRenderQueueList(state.queuePanel.items);
+      state.queuePanel.completionInFlight.delete(key);
     }
   }
 
-  // Optimistic single-row status change: remove from current view (both tabs
-  // would filter it out anyway), revert on failure.
-  async function handleStatusChange(item, newStatus) {
-    const listEl = document.getElementById('bhq-list');
-    const node = listEl && listEl.querySelector(`[data-mid="${item.match_id}"]`);
-    if (node) node.style.opacity = '0.4';
+  function showCompletionUndo(item, incremented) {
+    const bar = document.getElementById('bhq-undo-bar');
+    if (bar && state.queuePanel.open) {
+      if (state.queuePanel.undoTimer) clearTimeout(state.queuePanel.undoTimer);
+      if (state.queuePanel.undoInterval) clearInterval(state.queuePanel.undoInterval);
+      const message = document.getElementById('bhq-undo-message');
+      const count = document.getElementById('bhq-undo-count');
+      const button = document.getElementById('bhq-undo-btn');
+      const expiresAt = Date.now() + 5000;
+      if (message) message.textContent = `已完成：${item.name || '候选人'}`;
+      if (button) button.onclick = () => undoCandidateCompletion(item, incremented);
+      const tick = () => {
+        const seconds = Math.max(0, Math.ceil((expiresAt - Date.now()) / 1000));
+        if (count) count.textContent = `${seconds}秒`;
+      };
+      tick();
+      bar.classList.add('show');
+      state.queuePanel.undoInterval = setInterval(tick, 250);
+      state.queuePanel.undoTimer = setTimeout(hideCompletionUndo, 5000);
+      return;
+    }
+
+    let toast = document.getElementById('bhq-toast');
+    if (!toast) {
+      toast = document.createElement('div');
+      toast.id = 'bhq-toast';
+      document.body.appendChild(toast);
+    }
+    clearTimeout(toast._hideTimer);
+    if (state.queuePanel.undoTimer) clearTimeout(state.queuePanel.undoTimer);
+    toast.className = 'bhq-toast show undo';
+    toast.innerHTML = `<span>已完成：${esc(item.name || '候选人')}</span><button type="button">撤销</button>`;
+    toast.querySelector('button').addEventListener('click', () => undoCandidateCompletion(item, incremented));
+    state.queuePanel.undoTimer = setTimeout(() => {
+      toast.className = 'bhq-toast';
+      toast.textContent = '';
+      state.queuePanel.undoTimer = null;
+    }, 5000);
+  }
+
+  function hideCompletionUndo() {
+    const bar = document.getElementById('bhq-undo-bar');
+    bar?.classList.remove('show');
+    if (state.queuePanel.undoTimer) clearTimeout(state.queuePanel.undoTimer);
+    if (state.queuePanel.undoInterval) clearInterval(state.queuePanel.undoInterval);
+    state.queuePanel.undoTimer = null;
+    state.queuePanel.undoInterval = null;
+  }
+
+  async function undoCandidateCompletion(item, incremented) {
+    const toast = document.getElementById('bhq-toast');
     try {
-      await apiPatchRoot(`/outreach/${item.match_id}/status`, { status: newStatus });
-      // Remove from local list (queue tab filters out sent/skipped;
-      // skipped tab filters in only skipped so restore→new also leaves).
-      state.queuePanel.items = state.queuePanel.items.filter(x => x.match_id !== item.match_id);
-      state.queuePanel.itemsById.delete(item.match_id);
-      diffRenderQueueList(state.queuePanel.items);
-      setQueueStatus(`已更新: ${item.name} → ${statusTitle(newStatus)}`);
+      await apiPatchRoot(`/outreach/${encodeURIComponent(item.match_id)}/status`, { status: 'new' });
+      if (incremented) {
+        decrCounter();
+        state.queuePanel.counts.pending += 1;
+        state.queuePanel.counts.completed = Math.max(0, state.queuePanel.counts.completed - 1);
+        updateTabCounts();
+      }
+      hideCompletionUndo();
+      if (toast) { toast.className = 'bhq-toast'; toast.textContent = ''; }
+      showToast(`已撤销：${item.name || '候选人'}`);
+      if (state.queuePanel.open) await fetchQueue(true, true);
     } catch (err) {
-      if (node) node.style.opacity = '';
-      setQueueStatus('操作失败: ' + err.message, true);
-      showToast('操作失败: ' + err.message, true);
+      showToast(`撤销失败：${err.message}`, true);
     }
   }
 
-  async function doBulkStatus(newStatus) {
-    const items = state.queuePanel.items;
-    if (!items.length) { showToast('列表为空', true); return; }
-    const verb = newStatus === 'skipped' ? '跳过' : '恢复';
-    const selectedJob = state.jobs.find(j => String(j.id) === String(state.queuePanel.jobId));
-    const scope = selectedJob ? `岗位“${selectedJob.title}”` : '全部岗位';
-    if (!window.confirm(`确定要一键${verb}${scope}当前列表中的 ${items.length} 位候选人吗？`)) return;
-    setQueueStatus(`正在${verb} ${items.length} 位…`);
-    try {
-      const match_ids = items.map(x => x.match_id);
-      await apiPatchRoot('/outreach/bulk-status', { match_ids, status: newStatus });
-      setQueueStatus(`已${verb} ${items.length} 位候选人`);
-      showToast(`已${verb} ${items.length} 位`);
-      await fetchQueue(true);
-    } catch (err) {
-      setQueueStatus(`一键${verb}失败: ` + err.message, true);
-      showToast(`一键${verb}失败: ` + err.message, true);
+  function itemFromCard(card) {
+    const bossId = getCardCandidateId(card);
+    if (!bossId || !state.jobId) return null;
+    const queueItem = state.queuePanel.items.find(x => String(x.boss_id) === String(bossId));
+    if (queueItem) return queueItem;
+    const scanned = state.scanned.find(x => String(x.expectId) === String(bossId));
+    const fields = _structuredFields(card);
+    return {
+      ...(scanned || {}),
+      boss_id: bossId,
+      name: scanned?.name || fields.name || '候选人',
+      job_id: state.jobId,
+    };
+  }
+
+  function clickedGreetControl(target, root, scope) {
+    for (let el = target; el && el !== root.parentElement; el = el.parentElement) {
+      if (isGreetAction(el, scope)) return el;
+      if (el === root) break;
+    }
+    if (scope === 'card') {
+      const control = findCardGreetControl(root);
+      if (control && control.contains(target)) return control;
+    }
+    return null;
+  }
+
+  function panelCandidateMatch(panel, item) {
+    if (!panel || !item) return null;
+    const targetId = String(item.boss_id || item.expectId || '');
+    const ids = [...panel.querySelectorAll('[data-expect], [data-geek], [data-geekid]')]
+      .map(el => el.getAttribute('data-expect') || el.getAttribute('data-geek') || el.getAttribute('data-geekid'))
+      .filter(Boolean)
+      .map(String);
+    if (targetId && ids.includes(targetId)) return true;
+    if (targetId && ids.length) return false;
+    const targetName = String(item.name || '').replace(/[\s·•]/g, '');
+    const panelText = String(panel.innerText || '').replace(/[\s·•]/g, '');
+    return targetName && panelText.includes(targetName) ? true : null;
+  }
+
+  function nativeInteractionHandler(e) {
+    if (e.target.closest?.('#boss-helper-panel, #bhq-toast')) return;
+    const card = e.target.closest?.(CARD_SEL);
+    if (card) {
+      const item = itemFromCard(card);
+      if (item) setActiveCandidate(item, false, true);
+      if (item && clickedGreetControl(e.target, card, 'card')) {
+        markCandidateCompleted(item, 'manual');
+      }
+      return;
+    }
+
+    const resumePanel = findOpenResumePanels().find(panel => panel.contains(e.target));
+    if (!resumePanel || !clickedGreetControl(e.target, resumePanel, 'resume')) return;
+    const active = state.queuePanel.activeItem;
+    const panelMatch = panelCandidateMatch(resumePanel, active);
+    const reliable = active && Date.now() - state.queuePanel.activeAt < 5 * 60 * 1000 &&
+      (state.queuePanel.activeVerified || panelMatch === true);
+    if (reliable) {
+      markCandidateCompleted(active, 'manual');
+    } else if (panelMatch === false) {
+      showToast('弹窗候选人与刚打开的卡片不一致，未自动标记', true);
+    } else {
+      showToast('未读取到候选人 ID 或姓名，未自动标记；可使用“标记完成”', true);
     }
   }
 
-  function updateBulkGreetButtons() {
-    // Legacy bulk-greet controls were removed from the queue UI.
+  const _nativeBoundDocs = new WeakSet();
+  function bindNativeInteractionListeners() {
+    for (const doc of getAllDocs()) {
+      if (_nativeBoundDocs.has(doc)) continue;
+      doc.addEventListener('click', nativeInteractionHandler, true);
+      _nativeBoundDocs.add(doc);
+    }
   }
 
-  // The queue panel auto-refreshes every 10s (fetchQueue) which overwrites
-  // state.queuePanel.items — pause it for the duration of a bulk run so it
-  // can't clobber the list a running loop is iterating over.
-  function pauseQueueAutoRefresh() {
-    if (state.queuePanel.autoRefreshTimer) {
-      clearInterval(state.queuePanel.autoRefreshTimer);
-      state.queuePanel.autoRefreshTimer = null;
-    }
-  }
-  function resumeQueueAutoRefresh() {
-    if (state.queuePanel.open && !state.queuePanel.autoRefreshTimer) {
-      state.queuePanel.autoRefreshTimer = setInterval(() => fetchQueue(false), 10000);
-    }
-  }
 
   function showProgress(done, total, label) {
     const wrap = document.getElementById('bhq-progress-wrap');
@@ -2874,160 +2542,14 @@
     if (wrap) wrap.style.display = 'none';
   }
 
-  async function doBulkGreet() {
-    if (state.autoRunning || state.queuePanel.bulkGreetRunning) {
-      showToast('已有打招呼任务在运行', true);
-      return;
-    }
-    const allItems = state.queuePanel.items.filter(x => x && x.boss_id);
-    if (!allItems.length) { showToast('列表为空', true); return; }
-
-    const remainingCap = Math.max(0, state.dailyCap - state.greetingCount);
-    if (remainingCap === 0) { showToast('已达每日上限', true); return; }
-
-    const runCount = Math.min(allItems.length, remainingCap);
-    const estMinLow = Math.max(1, Math.round(runCount * state.delayMin / 60));
-    const estMinHigh = Math.max(1, Math.round(runCount * state.delayMax / 60));
-    const capNote = runCount < allItems.length
-      ? `（受今日上限限制，仅处理前 ${runCount}/${allItems.length} 位）` : '';
-    const confirmMsg =
-      `即将对 ${runCount} 位候选人依次打招呼${capNote}\n` +
-      `每人间隔 ${state.delayMin}-${state.delayMax} 秒，预计耗时约 ${estMinLow}-${estMinHigh} 分钟。\n` +
-      `发送内容为系统生成的模板话术，过程中可随时点击"停止打招呼"中断。是否继续？`;
-    if (!window.confirm(confirmMsg)) return;
-
-    // Snapshot: the loop works off this fixed array so the paused-but-just-
-    // in-case-late auto-refresh or other mutations can't shift indices mid-run.
-    const queue = allItems.slice(0, runCount);
-
-    state.queuePanel.bulkGreetRunning = true;
-    updateBulkGreetButtons();
-    pauseQueueAutoRefresh();
-
-    let sent = 0, notFound = 0, failed = 0;
-    showProgress(0, queue.length, '准备中…');
-
-    for (let i = 0; i < queue.length; i++) {
-      if (!state.queuePanel.bulkGreetRunning) break;
-
-      if (state.greetingCount >= state.dailyCap) {
-        setQueueStatus('已达每日上限，批量打招呼自动停止');
-        break;
-      }
-
-      // Re-read from itemsById: sendGreetingToItem mutates item.status in
-      // place, and this keeps the loop working off the live object the UI
-      // renders even though membership/order comes from the fixed snapshot.
-      const item = state.queuePanel.itemsById.get(queue[i].match_id) || queue[i];
-
-      state.queuePanel.sendingId = item.match_id;
-      showProgress(i, queue.length, `正在打招呼: ${item.name}`);
-
-      const res = await sendGreetingToItem(item, { mode: 'auto' });
-      if (res.ok) {
-        sent++;
-        state.queuePanel.items = state.queuePanel.items.filter(x => x.match_id !== item.match_id);
-        state.queuePanel.itemsById.delete(item.match_id);
-      } else if (res.reason === 'not_found') {
-        notFound++;
-      } else if (res.reason === 'hazard') {
-        failed++;
-        setQueueStatus(`检测到风控阻断(${res.detail})，批量打招呼已停止`, true);
-        state.queuePanel.sendingId = null;
-        state.queuePanel.bulkGreetRunning = false;
-        break;
-      } else if (res.reason === 'cap') {
-        setQueueStatus('已达每日上限，批量打招呼自动停止');
-        state.queuePanel.sendingId = null;
-        break;
-      } else if (res.reason === 'no_editable') {
-        // Account sends its default 招呼语 on click — custom templates aren't
-        // possible on this page. No point continuing the whole batch.
-        setQueueStatus('你的账号点"打招呼"直接发默认招呼语，无法插入模板，已停止', true);
-        showToast('账号不支持自定义招呼语，已停止批量', true);
-        state.queuePanel.sendingId = null;
-        state.queuePanel.bulkGreetRunning = false;
-        break;
-      } else {
-        failed++;
-      }
-
-      state.queuePanel.sendingId = null;
-      diffRenderQueueList(state.queuePanel.items);
-      showProgress(i + 1, queue.length, `${item.name} 已处理`);
-
-      if (i < queue.length - 1 && state.queuePanel.bulkGreetRunning) {
-        const delay = randDelay();
-        showProgress(i + 1, queue.length, `等待 ${Math.round(delay / 1000)} 秒…`);
-        await sleep(delay);
-      }
-    }
-
-    state.queuePanel.bulkGreetRunning = false;
-    state.queuePanel.sendingId = null;
-    updateBulkGreetButtons();
-    resumeQueueAutoRefresh();
-    hideProgress();
-
-    const summary = `批量打招呼完成：已发送 ${sent} 人` +
-      (notFound ? `，未找到 ${notFound} 人` : '') +
-      (failed ? `，失败 ${failed} 人` : '');
-    setQueueStatus(summary, failed > 0 || notFound > 0);
-    showToast(summary, failed > 0);
-    await fetchQueue(true);
-  }
-
-  function doBulkGreetStop() {
-    state.queuePanel.bulkGreetRunning = false;
-    setQueueStatus('正在停止批量打招呼…');
-  }
-
-  async function doLlmRerank() {
-    if (state.queuePanel.llmBusy) return;
-    const btn = document.getElementById('bhq-rerank');
-    if (!state.queuePanel.jobId) { showToast('请选择具体岗位后进行 AI 精评', true); return; }
-    state.queuePanel.llmBusy = true;
-    if (btn) { btn.disabled = true; btn.textContent = 'AI 评分中…'; }
-    setQueueStatus('AI 精评队列中，可能需要 1-3 分钟…');
-    try {
-      // /llm-rerank lives under /api/ext — reuse old apiPost (with /ext prefix).
-      // Backend returns 200 with {configured:false, error} when LLM isn't set.
-      const res = await apiPost('/llm-rerank', { job_id: state.queuePanel.jobId, limit: 60 });
-      if (res && res.configured === false) {
-        const msg = res.error || 'LLM 未配置';
-        setQueueStatus(msg, true);
-        showToast(msg, true);
-        return;
-      }
-      if (res && res.error) {
-        setQueueStatus('AI 精评失败: ' + res.error, true);
-        showToast('AI 精评失败: ' + res.error, true);
-        return;
-      }
-      const scored = (res && (res.scored ?? 0));
-      const skipped = (res && (res.skipped_existing ?? 0));
-      const summary = res?.message || `AI 精评完成：新评 ${scored} 人${skipped ? `，跳过已评 ${skipped} 人` : ''}`;
-      showToast(summary);
-      setQueueStatus(summary);
-      await fetchQueue(true);
-    } catch (err) {
-      setQueueStatus('AI 精评失败: ' + err.message, true);
-      showToast('AI 精评失败: ' + err.message, true);
-    } finally {
-      state.queuePanel.llmBusy = false;
-      if (btn) btn.textContent = 'AI 精评队列';
-      applyToolbarVisibility();
-    }
-  }
 
   async function doTrackedLlmRerank() {
-    if (state.queuePanel.llmBusy || state.queuePanel.bulkGreetRunning) return;
+    if (state.queuePanel.llmBusy) return;
     const btn = document.getElementById('bhq-rerank');
     const rerankJobId = getRerankJobId();
     if (!rerankJobId) { showToast('当前列表包含多个岗位，请先选择一个岗位', true); return; }
 
     state.queuePanel.llmBusy = true;
-    pauseQueueAutoRefresh();
     if (btn) { btn.disabled = true; btn.textContent = 'AI评分中'; }
     showProgress(0, 0, '正在创建评分任务');
     setQueueStatus('AI评分任务已启动，正在准备候选人…');
@@ -3041,7 +2563,7 @@
         const summary = started.message || `已有 ${skippedExisting} 人完成 AI 评分，无需重复评分`;
         showToast(summary);
         setQueueStatus(summary);
-        await fetchQueue(true);
+        await fetchQueue(true, true);
         return;
       }
       showProgress(0, started.total || 0, skippedExisting
@@ -3058,7 +2580,7 @@
           const summary = `AI评分完成：新评 ${task.scored}/${task.total} 人${skippedExisting ? `，跳过已评 ${skippedExisting} 人` : ''}`;
           showToast(summary);
           setQueueStatus(summary);
-          await fetchQueue(true);
+          await fetchQueue(true, true);
           return;
         }
         if (task.status === 'failed') throw new Error(task.error || 'AI评分失败');
@@ -3070,7 +2592,6 @@
       showToast(message, true);
     } finally {
       state.queuePanel.llmBusy = false;
-      resumeQueueAutoRefresh();
       hideProgress();
       if (btn) btn.textContent = 'AI评分';
       applyToolbarVisibility();
@@ -3088,12 +2609,12 @@
       '[class*="geek"][class*="detail"]', '[class*="detail"][class*="dialog"]',
       '[class*="resume"][class*="drawer"]',
     ].join(',');
-    const ownPanels = [document.getElementById('boss-helper-panel'), document.getElementById('boss-helper-queue-panel'), document.getElementById('boss-helper-candidate-archive')];
+    const ownPanels = [document.getElementById('boss-helper-panel'), document.getElementById('boss-helper-queue-panel')];
     for (const doc of getAllDocs()) {
       for (const panel of doc.querySelectorAll(selectors)) {
         if (!isVisibleElement(panel) || ownPanels.some(own => own && own.contains(panel))) continue;
         const text = (panel.innerText || '').slice(0, 2000);
-        if (!/(打招呼|联系Ta|联系TA)/.test(text)) continue;
+        if (!/(打招呼|立即沟通|继续沟通|去沟通|联系Ta|联系TA)/.test(text)) continue;
         if (!panels.includes(panel)) panels.push(panel);
       }
     }
@@ -3157,29 +2678,25 @@
 
   // Open exactly one verified resume from a live card. This prevents both
   // stacked BOSS modals and stale virtual-list references opening another user.
-  async function locateCardOnPage(item, options = {}) {
+  async function locateCardOnPage(item) {
     if (resumeOpenInFlight) {
       showToast('正在打开上一份简历，请稍候', true);
       return;
     }
     resumeOpenInFlight = true;
+    setActiveCandidate(item, false, false);
     try {
       const target = findCardByBossId(item.boss_id);
       if (!target || getCardCandidateId(target) !== item.boss_id) {
-        if (options.fallbackToArchive) {
-          const reason = '当前页面没有该候选人的真实卡片，因此暂时不能打招呼。已展示最近一次保存的候选人档案。';
-          setQueueStatus(`当前页未找到 ${item.name || '该候选人'}，已打开档案`);
-          openCandidateArchive(item, { reason });
-          showToast('当前页没有该候选人，已打开档案');
-        } else {
-          setQueueStatus('未找到与队列记录一致的当前卡片，未执行打开操作', true);
-          showToast('未找到与队列记录一致的当前卡片', true);
-        }
+        setQueueStatus('未找到与队列记录一致的当前卡片，未执行打开操作', true);
+        showToast('当前页已没有该候选人的真实卡片', true);
+        clearActiveCandidate();
         return false;
       }
       if (!await closeOpenResumePanels()) {
         setQueueStatus('未能自动关闭已有简历，请先关闭后再试', true);
         showToast('未能自动关闭已有简历，请先关闭后再试', true);
+        clearActiveCandidate();
         return false;
       }
       try { target.scrollIntoView({ behavior: 'smooth', block: 'center' }); } catch {}
@@ -3188,10 +2705,12 @@
       if (!openCardChat(target)) {
         setQueueStatus('未找到该候选人的简历入口', true);
         showToast('未找到该候选人的简历入口', true);
+        clearActiveCandidate();
         return false;
       }
       const result = await waitForResumeIdentity(item);
       if (result === 'confirmed') {
+        setActiveCandidate(item, true, true);
         setQueueStatus(`已定位并打开简历：${item.name || ''}`);
         return true;
       }
@@ -3200,8 +2719,13 @@
         const message = '检测到明确不同的候选人 ID，已自动关闭简历';
         setQueueStatus(message, true);
         showToast(message, true);
+        clearActiveCandidate();
         return false;
       }
+      // The queue action started from a live card whose boss_id matched exactly.
+      // Unless the popup exposes an explicit different ID (handled above), keep
+      // that recent card context as a reliable identity even when BOSS hides ID/name.
+      setActiveCandidate(item, true, true);
       const message = result === 'opened_unverified'
         ? `简历已打开：${item.name || ''}（页面未暴露可核验 ID，请人工确认姓名）`
         : `已执行打开操作：${item.name || ''}（未检测到标准简历弹层，请人工确认）`;
@@ -3214,4 +2738,9 @@
   }
 
   bindBadgeListeners();
+  bindNativeInteractionListeners();
+  setInterval(() => {
+    bindBadgeListeners();
+    bindNativeInteractionListeners();
+  }, 1200);
 })();

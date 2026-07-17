@@ -61,7 +61,7 @@ export default function Onboarding() {
         <Step n={3} title="打开 BOSS 直聘开始工作">
           <p>
             登录你的 BOSS <span className="font-medium">招聘者账号</span>，进入人才搜索/推荐页。
-            页面右侧会出现“BOSS 招聘助手”面板：选择岗位 → 扫描列表 → 半自动或自动打招呼。
+            页面右侧会出现“招聘助手”面板：选择岗位 → 扫描列表 → 半自动或自动打招呼。
           </p>
           <a
             href="https://www.zhipin.com/web/boss/recommend"
