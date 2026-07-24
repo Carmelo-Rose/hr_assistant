@@ -22,7 +22,7 @@ export default function Layout() {
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
           <div className="flex items-center justify-between h-16">
             <div className="flex items-center gap-3">
-              <h1 className="text-xl font-bold text-gray-900">BOSS 招聘助手</h1>
+              <h1 className="text-xl font-bold text-gray-900">招聘助手</h1>
               <nav className="flex items-center gap-1 ml-8">
                 {navLink('/dashboard', '今日队列')}
                 {navLink('/jobs', '岗位配置')}

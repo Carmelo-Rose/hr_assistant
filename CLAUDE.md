@@ -151,3 +151,9 @@ Edit `backend/config/search_profile.yaml` to change search keywords, scoring wei
 - **Backend**: Python 3.14, FastAPI, SQLAlchemy + SQLite, Playwright (CDP), uv
 - **Frontend**: React 19, TypeScript 6, Vite 5, TailwindCSS 4, TanStack Query, axios, oxlint
 - **CORS**: backend allows `localhost:5173` and `localhost:3000`
+
+## Userscript synchronization rule
+
+- 修改 userscript 时，以 `userscript/boss-helper.user.js` 为主文件。
+- 完成修改后，必须将相同的代码变更同步到 `userscript/生产环境使用.js`。
+- 同步到生产环境脚本时，必须保留其现有生产后端地址（当前为 `http://192.168.1.198:8010`），不得改成占位符或本地地址。

@@ -115,6 +115,35 @@ def test_ext_jobs_support_full_create_and_patch(client: TestClient):
         assert updated_data[key] == value
 
 
+def test_ext_score_persists_candidate_share_url(client: TestClient):
+    from app.models.database import SessionLocal
+    from app.models.candidate import Candidate
+
+    candidate_url = "https://www.zhipin.com/web/geek/detail/example"
+    resp = client.post(
+        "/api/ext/score",
+        json={
+            "job_id": "job-tmall-ops",
+            "threshold": 0,
+            "candidates": [{
+                "expectId": "share-url-candidate",
+                "name": "链接候选人",
+                "age": "28岁",
+                "experience": "5年",
+                "education": "本科",
+                "shareUrl": candidate_url,
+                "fullText": "5年天猫运营经验",
+            }],
+        },
+    )
+    assert resp.status_code == 200
+
+    db = SessionLocal()
+    candidate = db.query(Candidate).filter(Candidate.boss_id == "share-url-candidate").one()
+    assert candidate.share_url == candidate_url
+    db.close()
+
+
 def test_create_draft(client: TestClient):
     """Create candidate + match result, then draft."""
     from app.models.database import SessionLocal
@@ -197,6 +226,14 @@ def test_queue_includes_boss_id_and_profile_fields(client: TestClient):
         job_status="在职-月内到岗",
         expected_city="广州",
         skills="天猫运营,数据分析",
+        current_company="示例公司",
+        current_position="电商负责人",
+        school="示例大学",
+        major="电子商务",
+        experience_summary="负责天猫店铺从零到一运营",
+        raw_snapshot="候选人卡片原始快照",
+        source_keyword="天猫运营",
+        share_url="https://www.zhipin.com/example-candidate",
     )
     db.add(c)
     db.commit()
@@ -215,6 +252,16 @@ def test_queue_includes_boss_id_and_profile_fields(client: TestClient):
     assert item["work_years"] == "6年"
     assert item["expected_city"] == "广州"
     assert item["skills"] == "天猫运营,数据分析"
+    assert item["company"] == "示例公司"
+    assert item["title"] == "电商负责人"
+    assert item["school"] == "示例大学"
+    assert item["major"] == "电子商务"
+    assert item["experience_summary"] == "负责天猫店铺从零到一运营"
+    assert item["raw_snapshot"] == "候选人卡片原始快照"
+    assert item["source_keyword"] == "天猫运营"
+    assert item["share_url"] == "https://www.zhipin.com/example-candidate"
+    assert item["created_at"]
+    assert item["updated_at"]
 
 
 def test_queue_keeps_same_candidate_once_per_job(client: TestClient):
@@ -408,3 +455,97 @@ def test_llm_rerank_job_reports_real_batch_progress(client: TestClient, monkeypa
     assert latest["status"] == "succeeded"
     assert latest["processed"] == 3
     assert latest["scored"] == 3
+
+
+def test_llm_rerank_job_skips_existing_scores(client: TestClient, monkeypatch):
+    """Starting AI scoring again must preserve and skip durable prior scores."""
+    import time
+
+    from app.models.database import SessionLocal
+    from app.models.candidate import Candidate
+    from app.models.match_result import MatchResult
+    from app.routers import ext
+
+    db = SessionLocal()
+    done = Candidate(boss_id="rerank-already-done", name="已评候选人")
+    pending = Candidate(boss_id="rerank-pending", name="待评候选人")
+    db.add_all([done, pending])
+    db.commit()
+    db.add_all([
+        MatchResult(
+            candidate_id=done.id,
+            job_id="job-network",
+            score=85,
+            status="new",
+            llm_score=88,
+            llm_reason="原有评分",
+        ),
+        MatchResult(candidate_id=pending.id, job_id="job-network", score=80, status="new"),
+    ])
+    db.commit()
+    done_id = done.id
+    pending_id = pending.id
+    db.close()
+
+    monkeypatch.setattr(ext.llm_scoring, "is_configured", lambda: True)
+    monkeypatch.setattr(ext.llm_scoring, "build_job_desc", lambda job: job.title)
+    monkeypatch.setattr(
+        ext.llm_scoring,
+        "score_batch",
+        lambda briefs, _job_desc: {brief["id"]: {"score": 93, "reason": "新评分"} for brief in briefs},
+    )
+
+    started = client.post("/api/ext/llm-rerank-jobs", json={"job_id": "job-network", "limit": 60})
+    assert started.status_code == 202
+    payload = started.json()
+    assert payload["total"] == 1
+    assert payload["skipped_existing"] == 1
+
+    latest = None
+    for _ in range(30):
+        latest = client.get(f"/api/ext/llm-rerank-jobs/{payload['task_id']}").json()
+        if latest["status"] in {"succeeded", "failed"}:
+            break
+        time.sleep(0.05)
+    assert latest and latest["status"] == "succeeded"
+
+    verify = SessionLocal()
+    done_match = verify.query(MatchResult).filter(MatchResult.candidate_id == done_id).one()
+    pending_match = verify.query(MatchResult).filter(MatchResult.candidate_id == pending_id).one()
+    assert done_match.llm_score == 88
+    assert done_match.llm_reason == "原有评分"
+    assert pending_match.llm_score == 93
+    assert pending_match.llm_reason == "新评分"
+    verify.close()
+
+
+def test_llm_rerank_job_returns_noop_when_everyone_is_scored(client: TestClient, monkeypatch):
+    from app.models.database import SessionLocal
+    from app.models.candidate import Candidate
+    from app.models.match_result import MatchResult
+    from app.routers import ext
+
+    db = SessionLocal()
+    candidate = Candidate(boss_id="rerank-all-done", name="全部已评")
+    db.add(candidate)
+    db.commit()
+    db.add(MatchResult(
+        candidate_id=candidate.id,
+        job_id="job-network",
+        score=80,
+        status="new",
+        llm_score=90,
+        llm_reason="已有结果",
+    ))
+    db.commit()
+    db.close()
+
+    monkeypatch.setattr(ext.llm_scoring, "is_configured", lambda: True)
+    response = client.post("/api/ext/llm-rerank-jobs", json={"job_id": "job-network"})
+    assert response.status_code == 202
+    payload = response.json()
+    assert payload["completed"] is True
+    assert payload["total"] == 0
+    assert payload["skipped_existing"] == 1
+    assert "无需重复评分" in payload["message"]
+    assert "task_id" not in payload

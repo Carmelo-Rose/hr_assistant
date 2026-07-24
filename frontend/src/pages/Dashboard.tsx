@@ -197,7 +197,9 @@ export default function Dashboard() {
     onSuccess: (res) => {
       if (res.error) setRerankMsg(res.error);
       else if (!res.scored) setRerankMsg(res.message || '没有可精评的候选人');
-      else setRerankMsg(`AI 精评完成：${res.scored}/${res.total} 人已重排`);
+      else setRerankMsg(
+        `AI 精评完成：新评 ${res.scored}/${res.total} 人${res.skipped_existing ? `，跳过已评 ${res.skipped_existing} 人` : ''}`,
+      );
       queryClient.invalidateQueries({ queryKey: ['queue'] });
     },
     onError: (e: any) => setRerankMsg('AI 精评失败：' + (e?.message || '请求出错')),
@@ -266,7 +268,7 @@ export default function Dashboard() {
                   onClick={() => { setRerankMsg(null); rerankMutation.mutate(); }}
                   disabled={rerankMutation.isPending || !queue?.length}
                   className="px-3 py-1.5 text-xs font-medium bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 disabled:opacity-40"
-                  title="用国产大模型对入围名单重新打分排序"
+                  title="只对尚未有 AI 分数的候选人进行精评"
                 >
                   {rerankMutation.isPending ? 'AI 精评中…' : 'AI 精评'}
                 </button>
