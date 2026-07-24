@@ -2,7 +2,7 @@
 
 from app.models.job import Job
 from app.models.candidate import Candidate
-from app.services.scoring import score_candidate
+from app.services.scoring import score_candidate, score_candidate_by_job
 
 
 def test_score_age_pass():
@@ -116,3 +116,64 @@ def test_score_clamp():
     result = score_candidate(c, job)
     assert result["score"] <= 100
     assert result["score"] >= 90
+
+
+def test_userscript_score_blocks_age_min():
+    job = Job(id="j1", title="测试", age_min=25, age_max=38)
+    result = score_candidate_by_job({"age": "24岁", "fullText": "今日活跃"}, job)
+    assert result["is_blocked"] is True
+    assert result["age_pass"] == 0
+    assert "年龄低于要求" in "；".join(result["details"])
+
+
+def test_userscript_score_blocks_min_experience_years():
+    job = Job(id="j1", title="测试", min_experience_years=3)
+    result = score_candidate_by_job({"experience": "2年", "fullText": "今日活跃"}, job)
+    assert result["is_blocked"] is True
+    assert "经验年限不足" in "；".join(result["details"])
+
+
+def test_userscript_score_blocks_activity_requirement():
+    job = Job(id="j1", title="测试", active_requirement="3d")
+    result = score_candidate_by_job({"fullText": "本周活跃"}, job)
+    assert result["is_blocked"] is True
+    assert "活跃度不符合要求" in "；".join(result["details"])
+
+    fresh = score_candidate_by_job({"activeStatus": "今日活跃"}, job)
+    assert fresh["is_blocked"] is False
+
+
+def test_userscript_score_splits_chinese_keyword_separators():
+    job = Job(
+        id="j1",
+        title="测试",
+        experience_keywords="天猫，抖音、电商运营",
+        capability_keywords="团队管理，渠道策略、项目管理",
+    )
+    result = score_candidate_by_job(
+        {
+            "fullText": "5年天猫电商运营，负责团队管理和项目管理，今日活跃",
+            "skills": ["渠道策略"],
+        },
+        job,
+    )
+    assert result["experience_match"] == 1
+    assert result["capability_match"] == 1
+def test_userscript_score_salary_range_overlap_passes():
+    job = Job(id="j1", title="salary", salary_min_k=20, salary_max_k=30)
+    result = score_candidate_by_job({"salary": "25-35K"}, job)
+    assert result["is_blocked"] is False
+    assert any("薪资匹配" in detail for detail in result["details"])
+
+
+def test_userscript_score_salary_range_outside_blocks():
+    job = Job(id="j1", title="salary", salary_min_k=20, salary_max_k=30)
+    result = score_candidate_by_job({"salary": "10-15K"}, job)
+    assert result["is_blocked"] is True
+    assert any("薪资不匹配" in detail for detail in result["details"])
+
+
+def test_userscript_score_salary_unknown_is_not_blocked():
+    job = Job(id="j1", title="salary", salary_min_k=20, salary_max_k=30)
+    result = score_candidate_by_job({"salary": "面议"}, job)
+    assert result["is_blocked"] is False

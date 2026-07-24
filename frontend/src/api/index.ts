@@ -36,9 +36,15 @@ export interface Job {
   id: string;
   title: string;
   department: string;
+  age_min: number;
   age_max: number;
+  salary_min_k: number;
+  salary_max_k: number;
+  min_experience_years: number;
   experience_keywords: string;
   capability_keywords: string;
+  active_requirement: string;
+  turnover_frequency: string;
   active_hours: string;
   template: string;
 }

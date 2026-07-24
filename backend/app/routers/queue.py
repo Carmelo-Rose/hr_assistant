@@ -1,6 +1,7 @@
 """Today's outreach queue."""
 
-from typing import Optional
+from datetime import datetime
+from typing import Literal, Optional
 
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel
@@ -9,7 +10,11 @@ from sqlalchemy import desc, func
 
 from app.models.database import get_db
 from app.models.candidate import Candidate
-from app.models.match_result import MatchResult
+from app.models.match_result import (
+    COMPLETED_MATCH_STATUSES,
+    PENDING_MATCH_STATUSES,
+    MatchResult,
+)
 from app.models.outreach import OutreachRecord
 from app.models.job import Job
 
@@ -42,20 +47,32 @@ class QueueItem(BaseModel):
     job_status: str = ""
     expected_city: str = ""
     skills: str = ""
+    # Persisted candidate archive fields. The userscript uses these when the
+    # live BOSS card is no longer rendered after a refresh or page change.
+    company: str = ""
+    title: str = ""
+    school: str = ""
+    major: str = ""
+    experience_summary: str = ""
+    raw_snapshot: str = ""
+    source_keyword: str = ""
+    share_url: str = ""
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+    completed_at: datetime | None = None
 
 
 @router.get("/queue/today")
 def get_today_queue(
     job_id: Optional[str] = Query(None),
     status_filter: Optional[str] = Query(None),
+    view: Literal["pending", "completed"] = Query("pending"),
     limit: Optional[int] = Query(None, ge=1, le=500),
     db: Session = Depends(get_db),
 ):
     """
-    Build today's queue:
-    - For each MatchResult that is NOT sent_manual/skipped, or if already queued
-    - Order by: score desc, active_status bonus, completeness
-    - Dedup by candidate_id (pick best score first)
+    Build the current pending snapshot or durable completed-contact history.
+    - Dedup by (candidate_id, job_id) so one candidate can appear once per job
     """
     query = (
         db.query(MatchResult)
@@ -69,9 +86,10 @@ def get_today_queue(
         query = query.filter(MatchResult.job_id == job_id)
     if status_filter:
         query = query.filter(MatchResult.status == status_filter)
+    elif view == "completed":
+        query = query.filter(MatchResult.status.in_(COMPLETED_MATCH_STATUSES))
     else:
-        # Default: exclude finished ones
-        query = query.filter(~MatchResult.status.in_(["sent_manual", "skipped"]))
+        query = query.filter(MatchResult.status.in_(PENDING_MATCH_STATUSES))
 
     # Status priority for ordering
     from sqlalchemy import case
@@ -80,6 +98,15 @@ def get_today_queue(
         (MatchResult.status == "queued", 1),
         else_=2,
     )
+    ordering = [
+        desc(func.coalesce(MatchResult.llm_score, MatchResult.score)),
+        status_order,
+    ]
+    if view == "completed" and not status_filter:
+        ordering.insert(
+            0,
+            desc(func.coalesce(OutreachRecord.updated_at, MatchResult.created_at)),
+        )
 
     results = (
         query.add_columns(
@@ -93,27 +120,40 @@ def get_today_queue(
             Candidate.job_status,
             Candidate.expected_city,
             Candidate.skills,
+            Candidate.company,
+            Candidate.title,
+            Candidate.current_company,
+            Candidate.current_position,
+            Candidate.school,
+            Candidate.major,
+            Candidate.experience_summary,
+            Candidate.raw_snapshot,
+            Candidate.source_keyword,
+            Candidate.share_url,
+            Candidate.created_at,
+            Candidate.updated_at,
             Job.title.label("job_title"),
             OutreachRecord.id.label("outreach_id"),
+            OutreachRecord.updated_at.label("completed_at"),
         )
-        .order_by(
-            # AI 精评分优先(有就用 llm_score,没有回退规则分),统一 0-100 量纲
-            desc(func.coalesce(MatchResult.llm_score, MatchResult.score)),
-            status_order,
-        )
+        .order_by(*ordering)
         .all()
     )
 
-    # Dedup by candidate_id (keep highest score)
+    # Dedup by candidate + job. Keep different job matches visible in the
+    # all-jobs queue instead of accidentally merging them.
     seen = {}
     items = []
     for row in results:
         (mr, name, active_status, boss_id, age, education, work_years,
-         salary_range, job_status, expected_city, skills, job_title, outreach_id) = row
-        cid = mr.candidate_id
-        if cid in seen:
+         salary_range, job_status, expected_city, skills, company, title,
+         current_company, current_position, school, major, experience_summary,
+         raw_snapshot, source_keyword, share_url, created_at, updated_at,
+         job_title, outreach_id, completed_at) = row
+        key = (mr.candidate_id, mr.job_id)
+        if key in seen:
             continue
-        seen[cid] = True
+        seen[key] = True
         items.append(QueueItem(
             match_id=mr.id,
             candidate_id=mr.candidate_id,
@@ -139,6 +179,18 @@ def get_today_queue(
             job_status=job_status or "",
             expected_city=expected_city or "",
             skills=skills or "",
+            company=company or current_company or "",
+            title=title or current_position or "",
+            school=school or "",
+            major=major or "",
+            experience_summary=experience_summary or "",
+            raw_snapshot=raw_snapshot or "",
+            source_keyword=source_keyword or "",
+            share_url=share_url or "",
+            created_at=created_at,
+            updated_at=updated_at,
+            completed_at=(completed_at or mr.created_at)
+            if mr.status in COMPLETED_MATCH_STATUSES else None,
         ))
 
     if limit is not None:

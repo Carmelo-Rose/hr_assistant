@@ -2,6 +2,12 @@ import { useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { listJobs, patchJob, type Job } from '../api';
 
+const turnoverFrequencyLabels: Record<string, string> = {
+  any: '不限',
+  fewer_than_3_in_5y: '5年少于3份',
+  average_job_over_1y: '平均每份工作大于1年',
+};
+
 export default function JobConfig() {
   const queryClient = useQueryClient();
   const { data: jobs, isLoading } = useQuery({ queryKey: ['jobs'], queryFn: listJobs });
@@ -53,6 +59,24 @@ export default function JobConfig() {
             <div className="grid grid-cols-2 gap-4 text-sm">
               <Field label="部门" value={form.department || ''} isEditing={isEditing} field="department" form={editForm} setForm={setEditForm} />
               <Field label="最高年龄" value={form.age_max?.toString() || ''} isEditing={isEditing} field="age_max" form={editForm} setForm={setEditForm} />
+              <Field label="最低薪资（K/月）" value={form.salary_min_k?.toString() || ''} isEditing={isEditing} field="salary_min_k" form={editForm} setForm={setEditForm} />
+              <Field label="最高薪资（K/月）" value={form.salary_max_k?.toString() || ''} isEditing={isEditing} field="salary_max_k" form={editForm} setForm={setEditForm} />
+              <div>
+                <label className="block text-xs font-medium text-gray-500 mb-1">跳槽频率（BOSS 原生单选）</label>
+                {isEditing ? (
+                  <select
+                    value={editForm.turnover_frequency || 'any'}
+                    onChange={(e) => setEditForm(p => ({ ...p, turnover_frequency: e.target.value }))}
+                    className="w-full text-sm border border-gray-200 rounded-lg px-2 py-1.5 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  >
+                    {Object.entries(turnoverFrequencyLabels).map(([value, label]) => (
+                      <option key={value} value={value}>{label}</option>
+                    ))}
+                  </select>
+                ) : (
+                  <div className="text-sm text-gray-700">{turnoverFrequencyLabels[form.turnover_frequency || 'any'] || '不限'}</div>
+                )}
+              </div>
               <Field label="经验关键词" value={form.experience_keywords || ''} isEditing={isEditing} field="experience_keywords" form={editForm} setForm={setEditForm} />
               <Field label="能力关键词" value={form.capability_keywords || ''} isEditing={isEditing} field="capability_keywords" form={editForm} setForm={setEditForm} />
               <Field label="活跃时段" value={form.active_hours || ''} isEditing={isEditing} field="active_hours" form={editForm} setForm={setEditForm} />
@@ -97,7 +121,12 @@ function Field({
         <input
           type="text"
           value={form[field] ?? value}
-          onChange={(e) => setForm(p => ({ ...p, [field]: field === 'age_max' ? parseInt(e.target.value) || 0 : e.target.value }))}
+          onChange={(e) => setForm(p => ({
+            ...p,
+            [field]: ['age_min', 'age_max', 'salary_min_k', 'salary_max_k', 'min_experience_years'].includes(field)
+              ? parseInt(e.target.value) || 0
+              : e.target.value,
+          }))}
           className="w-full text-sm border border-gray-200 rounded-lg px-2 py-1.5 focus:outline-none focus:ring-2 focus:ring-blue-500"
         />
       ) : (

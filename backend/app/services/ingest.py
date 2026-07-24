@@ -23,6 +23,8 @@ def upsert_candidate(
     candidate_dict: dict,
     score_result: dict,
     source_keyword: str = "",
+    *,
+    commit: bool = True,
 ) -> Candidate:
     """Upsert a Candidate from a scraper dict (EXTRACT_CARDS_JS shape).
 
@@ -61,6 +63,8 @@ def upsert_candidate(
             existing.age = parsed_age
         if candidate_dict.get("fullText"):
             existing.experience_summary = candidate_dict.get("fullText", "")
+        if candidate_dict.get("shareUrl"):
+            existing.share_url = candidate_dict["shareUrl"]
         existing.score = score_result["score"]
         if source_keyword:
             existing.source_keyword = source_keyword
@@ -85,10 +89,16 @@ def upsert_candidate(
             expected_city=candidate_dict.get("expectCity", ""),
             major=candidate_dict.get("major", ""),
             score=score_result["score"],
+            share_url=candidate_dict.get("shareUrl", ""),
             source_keyword=source_keyword,
         )
         db.add(candidate)
 
-    db.commit()
-    db.refresh(candidate)
+    if commit:
+        db.commit()
+        db.refresh(candidate)
+    else:
+        # Flush assigns the primary key for new candidates while keeping the
+        # caller's larger replace operation inside one transaction.
+        db.flush()
     return candidate

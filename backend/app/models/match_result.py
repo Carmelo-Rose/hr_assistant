@@ -4,6 +4,10 @@ from datetime import datetime, timezone
 from app.models.database import Base
 
 
+PENDING_MATCH_STATUSES = ("new", "queued", "drafted", "filled")
+COMPLETED_MATCH_STATUSES = ("sent_manual", "sent_auto")
+
+
 class MatchResult(Base):
     __tablename__ = "match_results"
 
@@ -17,7 +21,7 @@ class MatchResult(Base):
     experience_match = Column(Integer, default=0)
     capability_match = Column(Integer, default=0)
     is_queued = Column(Integer, default=0)
-    status = Column(String(32), default="new")  # new | queued | drafted | filled | sent_manual | skipped
+    status = Column(String(32), default="new")  # pending statuses above | sent_manual | sent_auto | skipped (legacy)
     # LLM 精评结果（规则分保留在 score，AI 分独立存储以便对比）
     llm_score = Column(Float, nullable=True)
     llm_reason = Column(Text, default="")

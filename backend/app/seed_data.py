@@ -1,9 +1,8 @@
 """默认岗位定义 — 单一数据源。
 
 main.py 首次启动时用它 seed 空库；scripts/sync_jobs.py 用它把已存在的库同步到最新。
-注意：模型只有 age_max（年龄上限）这一项硬筛维度，scorer 也只对超过 age_max 扣分。
-年龄下限、"3年以上经验"、"3日内活跃" 等属于人工/搜索关键词层面的筛选，不进自动评分。
-招呼语为固定文案；如需个性化可插入 {name} / {key_skill} / {experience_years} / {job_title} 占位符。
+新版 userscript 主链路会使用 age_min / age_max / min_experience_years /
+active_requirement 做硬筛；旧字段 active_hours/template 仅保留兼容。
 """
 
 DEFAULT_JOBS = [
@@ -12,9 +11,12 @@ DEFAULT_JOBS = [
         "title": "电商品牌项目经理",
         "department": "品牌项目部",
         # 筛选：25-38岁 / 天猫或抖音运营3年以上 / 团队经验 / 3日内活跃
+        "age_min": 25,
         "age_max": 38,
+        "min_experience_years": 3,
         "experience_keywords": "天猫,抖音,电商运营,品牌,操盘",
         "capability_keywords": "团队管理,渠道策略,全渠道,从0到1,项目管理",
+        "active_requirement": "3d",
         "active_hours": "09:00-18:00",
         "template": (
             "我们刚拿下服配线全渠道授权，现缺一位线上全平台总负责人。"
@@ -27,9 +29,12 @@ DEFAULT_JOBS = [
         "title": "品牌天猫运营",
         "department": "电商运营部",
         # 筛选：24-35岁 / 淘系独立运营3年以上 / 3日内活跃
+        "age_min": 24,
         "age_max": 35,
+        "min_experience_years": 3,
         "experience_keywords": "天猫,淘宝,淘系,电商运营",
         "capability_keywords": "独立运营,天猫运营,店铺运营,直通车",
+        "active_requirement": "3d",
         "active_hours": "09:00-21:00",
         "template": (
             "你好，我们在招一名天猫运营。品牌服饰配饰独家，公司体量大，资源足；"
@@ -42,9 +47,12 @@ DEFAULT_JOBS = [
         "title": "拼多多运营（品牌服配）",
         "department": "电商运营部",
         # 筛选：24-33岁 / 拼多多独立运营3年以上 / 3日内活跃
+        "age_min": 24,
         "age_max": 33,
+        "min_experience_years": 3,
         "experience_keywords": "拼多多,多多,电商运营",
         "capability_keywords": "独立运营,拼多多运营,服饰,配饰",
+        "active_requirement": "3d",
         "active_hours": "09:00-21:00",
         "template": (
             "你好，我们在招拼多多运营。品牌服饰配饰独家，公司体量大，资源足；"
@@ -57,9 +65,12 @@ DEFAULT_JOBS = [
         "title": "网络推广",
         "department": "市场推广部",
         # 筛选：24-30岁 / 抖音或国内电商运营3年以上 / 数据分析能力强
+        "age_min": 24,
         "age_max": 30,
+        "min_experience_years": 3,
         "experience_keywords": "抖音,电商运营,推广",
         "capability_keywords": "数据分析,二类电商,信息流,投放",
+        "active_requirement": "3d",
         "active_hours": "09:00-18:00",
         "template": (
             "你好，我们在招二类电商运营。我们公司抖音起号能力强、素材强、团队成熟，"
